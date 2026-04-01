@@ -1686,6 +1686,14 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
             }
             if (pinBlocks)
             {
+                // Claim block from free queue before pinning so that
+                // unpinBlocksById can safely releaseBlock it back later.
+                // Without this, the block stays in the free queue while pinned,
+                // and the subsequent releaseBlock creates a duplicate entry.
+                if (!searchRoot->hasRefs())
+                {
+                    mEvictionPolicy->claimBlock(searchRoot, searchRoot->getPriority(), searchRoot->getDurationMs());
+                }
                 searchRoot->incRefCount();
                 pinnedBlockIds.push_back(searchRoot->getBlockId());
             }
