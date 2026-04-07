@@ -485,8 +485,9 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
 {
     bool blockAll = !atLeastRequestNum.has_value();
     std::optional<int> senderFutureTimeoutMs = std::nullopt;
-    // If blockAll is true, we want to block and not use a timeout
-    if (!blockAll && mCacheTransceiverConfig.has_value())
+    // Always use a bounded timeout to prevent unbounded blocking.
+    // The caller (scheduler) loops, so timed-out transfers retry on next iteration.
+    if (mCacheTransceiverConfig.has_value())
     {
         senderFutureTimeoutMs = mCacheTransceiverConfig->getKvTransferSenderFutureTimeoutMs();
     }
@@ -551,8 +552,9 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
             try
             {
                 // Wait for up to a specified timeout
-                auto status = future.wait_for(std::chrono::milliseconds(senderFutureTimeoutMs.value_or(0)));
-                if (status == std::future_status::ready || !senderFutureTimeoutMs.has_value())
+                auto const timeoutMs = senderFutureTimeoutMs.value_or(1000);
+                auto status = future.wait_for(std::chrono::milliseconds(timeoutMs));
+                if (status == std::future_status::ready)
                 {
                     future.get();
                     requestsStatus.completedRequestIds.insert(request->mRequestId);
@@ -564,8 +566,8 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                 }
                 else if (status == std::future_status::timeout)
                 {
-                    TLLM_LOG_WARNING("Timed out waiting for context KV cache transfer after %d milliseconds.",
-                        senderFutureTimeoutMs.value());
+                    TLLM_LOG_WARNING(
+                        "Timed out waiting for context KV cache transfer after %d milliseconds.", timeoutMs);
                     ++it;
                 }
                 else
@@ -600,8 +602,9 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
 {
     bool blockAll = !atLeastRequestNum.has_value();
     std::optional<int> receiverFutureTimeoutMs = std::nullopt;
-    // If blockAll is true, we want to block and not use a timeout
-    if (!blockAll && mCacheTransceiverConfig.has_value())
+    // Always use a bounded timeout to prevent unbounded blocking.
+    // The caller (scheduler) loops, so timed-out transfers retry on next iteration.
+    if (mCacheTransceiverConfig.has_value())
     {
         receiverFutureTimeoutMs = mCacheTransceiverConfig->getKvTransferSenderFutureTimeoutMs();
     }
@@ -723,9 +726,9 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
             try
             {
                 // Wait for up to a specified timeout
-                auto status = it->second.wait_for(
-                    std::chrono::milliseconds(receiverFutureTimeoutMs.value_or(0)));
-                if (status == std::future_status::ready || !receiverFutureTimeoutMs.has_value())
+                auto const timeoutMs = receiverFutureTimeoutMs.value_or(1000);
+                auto status = it->second.wait_for(std::chrono::milliseconds(timeoutMs));
+                if (status == std::future_status::ready)
                 {
                     it->second.get();
                     it->first->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
@@ -753,14 +756,14 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
                 }
                 else if (status == std::future_status::timeout)
                 {
-                    TLLM_LOG_WARNING("Timed out waiting for generation KV cache transfer after %d milliseconds.",
-                        receiverFutureTimeoutMs.value());
+                    TLLM_LOG_WARNING(
+                        "Timed out waiting for generation KV cache transfer after %d milliseconds.", timeoutMs);
                     ++it;
                 }
                 else
                 {
-                    TLLM_LOG_ERROR("Future returned unexpected status for request %ld. Marking as error",
-                        it->first->mRequestId);
+                    TLLM_LOG_ERROR(
+                        "Future returned unexpected status for request %ld. Marking as error", it->first->mRequestId);
                     it->first->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
                     it = mRequesterFutures.erase(it);
                 }
