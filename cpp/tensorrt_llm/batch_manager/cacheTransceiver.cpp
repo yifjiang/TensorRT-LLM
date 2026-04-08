@@ -719,6 +719,7 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
             " checkGenTransferStatus toCompleteIdSet size: %zu, atLeastRequestNum: %d ", toCompleteIdSet.size(),
             atLeastRequestNum.value_or(0));
     }
+    auto const syncSize = (syncComm != nullptr) ? syncComm->getSize() : 1;
     for (auto it = mRequesterFutures.begin(); it != mRequesterFutures.end();)
     {
         if (blockAll || toCompleteIdSet.find(it->first->mRequestId) != toCompleteIdSet.end())
@@ -733,12 +734,17 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
                     it->second.get();
                     it->first->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
 
-                    // Gather the kv cache transfer time from all workers and update to leader rank
+                    // Gather the kv cache transfer time from all workers and update to leader rank.
+                    // Only call the timing collective when either all ranks block together (blockAll)
+                    // or the request was confirmed ready on every rank in the initial poll, to avoid
+                    // hanging in allgather when a peer timed out and skipped this request.
                     if (!common::getEnvKVCacheTimeOutputPath().empty())
                     {
-                        auto syncComm
-                            = mCacheState->getParallelConfig().mEnableAttentionDP ? mGroupDataComm : mGroupComm;
-                        updateKVCacheTransferBW(syncComm, it->first);
+                        auto const freqIt = frequencyMap.find(it->first->mRequestId);
+                        if (blockAll || (freqIt != frequencyMap.end() && freqIt->second == syncSize))
+                        {
+                            updateKVCacheTransferBW(syncComm, it->first);
+                        }
                     }
                     if (useMPI())
                     {
@@ -762,8 +768,8 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
                 }
                 else
                 {
-                    TLLM_LOG_ERROR(
-                        "Future returned unexpected status for request %ld. Marking as error", it->first->mRequestId);
+                    TLLM_LOG_ERROR("Future returned unexpected status for request %ld. Marking as error",
+                        it->first->mRequestId);
                     it->first->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
                     it = mRequesterFutures.erase(it);
                 }
