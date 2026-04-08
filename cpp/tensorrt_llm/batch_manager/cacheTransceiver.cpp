@@ -765,8 +765,8 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
                 }
                 else
                 {
-                    TLLM_LOG_ERROR("Future returned unexpected status for request %ld. Marking as error",
-                        it->first->mRequestId);
+                    TLLM_LOG_ERROR(
+                        "Future returned unexpected status for request %ld. Marking as error", it->first->mRequestId);
                     it->first->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
                     it = mRequesterFutures.erase(it);
                 }
