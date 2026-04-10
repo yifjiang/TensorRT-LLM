@@ -76,7 +76,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 # large multiplier is cheap.
                 max_concurrent_sessions=max(1, int(kv_cache_manager.max_batch_size)) * 20000,
                 tx_timeout_s=self._sender_future_timeout_ms / 1000.0,
-                rx_timeout_s=self.kv_transfer_timeout_ms / 1000.0,
+                rx_timeout_s=self._sender_future_timeout_ms / 1000.0,
             )
         )
         self._dp_rank = mapping.tp_rank if mapping.enable_attention_dp else 0
