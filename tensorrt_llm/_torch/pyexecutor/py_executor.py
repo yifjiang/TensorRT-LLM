@@ -3100,8 +3100,16 @@ class PyExecutor:
                         resource_mgr_type].prepare_resources(
                             disagg_gen_init_to_prepare)
 
-            # Trigger KV cache exchange for new disagg_gen_init_requests
-            self._recv_disagg_gen_cache(fitting_disagg_gen_init_requests)
+            # Use the filtered batch after prepare_resources, not the original
+            # list.  prepare_resources may skip add_sequence for some requests
+            # (e.g. reuse budget exhaustion) and remove them from the batch via
+            # reset_context_requests.  Passing skipped requests to KV transfer
+            # causes unordered_map::at in getSequence because the sequence was
+            # never registered.  Skipped requests remain in active_requests
+            # with DISAGG_GENERATION_INIT state and will be rescheduled.
+            accepted_requests = list(
+                disagg_gen_init_to_prepare.context_requests)
+            self._recv_disagg_gen_cache(accepted_requests)
 
     @nvtx_range("_prepare_disagg_gen_transmission_complete")
     def _prepare_disagg_gen_transmission_complete(self, scheduled_batch):
@@ -3748,9 +3756,6 @@ class PyExecutor:
                                     f"Request {request.py_request_id} has no avg_decoded_tokens_per_iter"
                                 )
 
-                # If partial reuse is enabled, and the KV cache manager is not VSWA, and the PP size is 1,
-                # then we need to terminate the request. TODO: Remove this once disagg support from KVCache reuse
-                # path is fixed.
                 if request.is_disagg_context_complete_state:
                     # Already terminated (or attempted) by
                     # _check_disagg_ctx_cache_transfer_status; re-terminating
@@ -3758,16 +3763,12 @@ class PyExecutor:
                     # (nvbug/5961736).
                     pass
                 elif request.is_disagg_context_transmission_state:
-                    # Request is still transferring KV cache to the decode worker.
-                    # Do NOT terminate — the C++ CacheTransceiver still holds a raw
-                    # pointer to this request in mSenderFutures. Terminating now
-                    # would free the LlmRequest and create a dangling pointer,
-                    # causing use-after-free (request ID reads as 0, transfer start
-                    # reads as epoch). Let the transfer complete or time out via
-                    # kv_transfer_timeout_ms in checkContextTransferStatus.
+                    # Never terminate a request while KV cache transfer is
+                    # still in progress — the GEN worker may still be receiving
+                    # data from the pinned blocks.  The request will be
+                    # terminated by _end_transfer_and_maybe_terminate once the
+                    # transfer completes (or times out).
                     pass
-                elif self.enable_partial_reuse_for_disagg and not self.kv_cache_manager.is_vswa and self.dist.pp_size == 1:
-                    requests_to_terminate.append(request)
                 else:
                     requests_to_terminate.append(request)
             else:
