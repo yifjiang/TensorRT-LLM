@@ -167,12 +167,8 @@ class TestCheckGenTransferStatusMixed:
         req_fail = _make_mock_request()
 
         txr = _make_transceiver(
-            recv_sessions={
-                "ok": session_ok, "timeout": session_timeout, "fail": session_fail
-            },
-            recv_reqs={
-                "ok": req_ok, "timeout": req_timeout, "fail": req_fail
-            },
+            recv_sessions={"ok": session_ok, "timeout": session_timeout, "fail": session_fail},
+            recv_reqs={"ok": req_ok, "timeout": req_timeout, "fail": req_fail},
         )
 
         KvCacheTransceiverV2.check_gen_transfer_status(txr, at_least_request_num=None)
@@ -247,8 +243,7 @@ class TestCheckGenTransferStatusBlockAll:
 
     def test_block_all_processes_all_requests(self):
         sessions = {
-            f"rid-{i}": _make_mock_session(wait_result=WaitResult.COMPLETED)
-            for i in range(3)
+            f"rid-{i}": _make_mock_session(wait_result=WaitResult.COMPLETED) for i in range(3)
         }
         reqs = {f"rid-{i}": _make_mock_request() for i in range(3)}
 
