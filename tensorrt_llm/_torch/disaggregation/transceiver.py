@@ -385,6 +385,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 completed.append(rid)
             elif result == WaitResult.FAILED:
                 failed.append(rid)
+            elif result == WaitResult.TIMEOUT:
+                # Keep the request for retry on the next iteration instead of
+                # marking it as a terminal error immediately.  The overall
+                # kv_transfer_timeout_ms will eventually clean it up.
+                logger.warning(
+                    f"RxSession rid={rid} timed out waiting for gen KV transfer"
+                )
             # else: None — KV done but aux still in flight; re-poll next cycle
 
         for rid in completed:
