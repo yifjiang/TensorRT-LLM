@@ -7,7 +7,6 @@ Tests the timeout and retry behavior for gen-side KV transfer:
 - Failed transfers are cleaned up and marked DISAGG_TRANS_ERROR
 """
 
-from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
@@ -20,10 +19,11 @@ def _make_mock_session(status=SessionStatus.KV_TRANSFERRED, wait_result=WaitResu
     """Create a mock RxSession with configurable state and wait_complete result."""
     session = MagicMock()
     session.status = status
-    session.is_completed.return_value = (status in (
-        SessionStatus.KV_TRANSFERRED, SessionStatus.FULLY_TRANSFERRED
-    ))
-    session.has_failed.return_value = (status == SessionStatus.ERROR)
+    session.is_completed.return_value = status in (
+        SessionStatus.KV_TRANSFERRED,
+        SessionStatus.FULLY_TRANSFERRED,
+    )
+    session.has_failed.return_value = status == SessionStatus.ERROR
     session.wait_complete.return_value = wait_result
     return session
 
@@ -134,9 +134,7 @@ class TestCheckGenTransferStatusFailed:
     """Tests for terminal failure (WaitResult.FAILED)."""
 
     def test_failed_transfer_sets_error_and_cleans_up(self):
-        session = _make_mock_session(
-            status=SessionStatus.ERROR, wait_result=WaitResult.FAILED
-        )
+        session = _make_mock_session(status=SessionStatus.ERROR, wait_result=WaitResult.FAILED)
         req = _make_mock_request()
         rid = "req-1"
 
@@ -159,9 +157,7 @@ class TestCheckGenTransferStatusMixed:
     def test_mixed_completed_timed_out_and_failed(self):
         session_ok = _make_mock_session(wait_result=WaitResult.COMPLETED)
         session_timeout = _make_mock_session(wait_result=WaitResult.TIMEOUT)
-        session_fail = _make_mock_session(
-            status=SessionStatus.ERROR, wait_result=WaitResult.FAILED
-        )
+        session_fail = _make_mock_session(status=SessionStatus.ERROR, wait_result=WaitResult.FAILED)
         req_ok = _make_mock_request()
         req_timeout = _make_mock_request()
         req_fail = _make_mock_request()
