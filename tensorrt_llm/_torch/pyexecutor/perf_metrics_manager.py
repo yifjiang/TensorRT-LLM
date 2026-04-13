@@ -11,6 +11,7 @@ from typing import Optional
 
 import torch
 
+from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
 
 from .llm_request import PerfTimingInfo
@@ -176,10 +177,16 @@ class PerfMetricsManager:
                         if perf.gpu_sample_end_event
                         else 0.0
                     )
-                except RuntimeError:
+                except RuntimeError as e:
                     # CUDA event timing can fail if events were not recorded
                     # on the current stream. Skip metrics for this batch rather
                     # than crashing the executor thread.
+                    logger.warning(
+                        "Failed to compute GPU event elapsed_time: %s. "
+                        "Setting batch GPU times to 0.0. This may indicate "
+                        "an issue with the forward pass or stream synchronization.",
+                        e,
+                    )
                     batch_gpu_forward_time = 0.0
                     batch_gpu_sample_time = 0.0
 
