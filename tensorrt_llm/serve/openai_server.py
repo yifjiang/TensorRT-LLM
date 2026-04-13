@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 import asyncio
 import base64
+import json
 import os
 import re
 import signal
@@ -36,13 +37,13 @@ from tensorrt_llm.inputs.data import TokensPrompt, visual_gen_inputs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.utils import ConversationMessage, apply_chat_template
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
-from tensorrt_llm.llmapi import (MultimodalEncoder, VisualGen, VisualGenParams,
-                                 tracing)
+from tensorrt_llm.llmapi import MultimodalEncoder, tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MetadataServerConfig, ServerRole)
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.logger import logger
 from tensorrt_llm.metrics.collector import MetricsCollector
+from tensorrt_llm.sampling_params import GuidedDecodingParams
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
                                            parse_chat_messages_coroutines)
 from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
@@ -61,6 +62,7 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ImageObject,
                                                 MemoryUpdateRequest, ModelCard,
                                                 ModelList, PromptTokensDetails,
+                                                ResponseFormat,
                                                 ResponsesRequest,
                                                 ResponsesResponse,
                                                 UpdateWeightsRequest, UsageInfo,
@@ -86,6 +88,7 @@ from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.serve.visual_gen_utils import (VIDEO_STORE,
                                                  parse_visual_gen_params)
 from tensorrt_llm.version import __version__ as VERSION
+from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
 
 from .._utils import nvtx_mark, set_prometheus_multiproc_dir
 from .harmony_adapter import (HarmonyAdapter, get_harmony_adapter,
@@ -93,6 +96,90 @@ from .harmony_adapter import (HarmonyAdapter, get_harmony_adapter,
 
 # yapf: enable
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
+
+
+def _build_tool_strict_guided_decoding_params(tools, tool_parser_name):
+    """Build GuidedDecodingParams with structural tags for tools with strict=True.
+
+    When a tool has ``strict=True`` in its function definition, the server
+    should use constrained decoding to guarantee that the generated tool call
+    arguments exactly match the function's ``parameters`` JSON Schema.
+
+    This function builds structural tag items from each tool parser's
+    ``structure_info()`` and the tool's ``parameters`` schema, then returns
+    a ``GuidedDecodingParams`` with the structural tag format.
+
+    Returns None if no tool has strict=True or the parser doesn't support
+    structural tags.
+    """
+    if not tools or not tool_parser_name:
+        return None
+
+    # Check if any tool has strict=True
+    has_strict = any(tool.function.strict for tool in tools
+                     if tool.function.strict)
+    if not has_strict:
+        return None
+
+    tool_parser_cls = ToolParserFactory.parsers.get(tool_parser_name.lower())
+    if tool_parser_cls is None:
+        logger.warning(
+            "Tool parser '%s' not found, cannot enforce strict mode for tools.",
+            tool_parser_name)
+        return None
+
+    parser = tool_parser_cls()
+    if not parser.supports_structural_tag():
+        logger.warning(
+            "Tool parser '%s' does not support structural tags, "
+            "cannot enforce strict mode for tools.", tool_parser_name)
+        return None
+
+    get_info = parser.structure_info()
+
+    tags = []
+    triggers = set()
+    for tool in tools:
+        info = get_info(tool.function.name)
+        triggers.add(info.trigger)
+
+        if tool.function.strict and tool.function.parameters:
+            # Strict tool: constrain arguments to match the JSON Schema
+            content = {
+                "type": "json_schema",
+                "json_schema": tool.function.parameters,
+            }
+        else:
+            # Non-strict tool or no parameters: allow any text
+            content = {"type": "any_text"}
+
+        tags.append({
+            "begin": info.begin,
+            "content": content,
+            "end": info.end,
+        })
+
+    stag_format = {
+        "type": "triggered_tags",
+        "triggers": sorted(triggers),
+        "tags": tags,
+    }
+
+    resp_format = ResponseFormat(type="structural_tag", format=stag_format)
+    return GuidedDecodingParams(structural_tag=resp_format.model_dump_json(
+        by_alias=True, exclude_none=True))
+
+
+def _normalize_image_output(image) -> list:
+    """Normalize image output to a list of individual images.
+
+    Handles single tensors, batched 4D tensors, and lists.
+    """
+    if isinstance(image, list):
+        return image
+    if hasattr(image, "dim") and image.dim() == 4:
+        return [image[i] for i in range(image.shape[0])]
+    return [image]
 
 
 class OpenAIServer:
@@ -294,14 +381,122 @@ class OpenAIServer:
 
         if self.generator.args.return_perf_metrics:
             set_prometheus_multiproc_dir()
-            self.metrics_collector = MetricsCollector({
-                "model_name": "undefined",
-                "engine_type": "undefined"
-            })
+            args = self.generator.args
+            pmc = getattr(args, "prometheus_metrics_config", None)
+            self.metrics_collector = MetricsCollector(
+                {
+                    "model_name": self.model,
+                    "engine_type": args.backend or "unknown"
+                },
+                e2e_request_latency_buckets=(pmc.e2e_request_latency_buckets
+                                             if pmc else None),
+                time_to_first_token_buckets=(pmc.time_to_first_token_buckets
+                                             if pmc else None),
+                time_per_output_token_buckets=(pmc.time_per_output_token_buckets
+                                               if pmc else None),
+                request_queue_time_buckets=(pmc.request_queue_time_buckets
+                                            if pmc else None),
+                request_prefill_time_buckets=(pmc.request_prefill_time_buckets
+                                              if pmc else None),
+                request_decode_time_buckets=(pmc.request_decode_time_buckets
+                                             if pmc else None),
+                request_inference_time_buckets=(
+                    pmc.request_inference_time_buckets if pmc else None),
+            )
+            self._log_config_info_metrics()
             max_perf_metrics = self.generator.args.perf_metrics_max_requests
             if max_perf_metrics > 0:
                 self.perf_metrics = deque(maxlen=max_perf_metrics)
                 self.perf_metrics_lock = asyncio.Lock()
+
+    def _log_config_info_metrics(self) -> None:
+        """Extract configuration from generator args and log as Prometheus info gauges."""
+        args = self.generator.args
+
+        # Model config
+        model_config = {
+            "model": str(args.model),
+            "served_model_name": self.model,
+            "dtype": str(args.dtype),
+        }
+        quant_config = getattr(args, "quant_config", None)
+        if quant_config is not None:
+            quant_algo = getattr(quant_config, "quant_algo", None)
+            model_config["quantization"] = str(
+                quant_algo) if quant_algo else "none"
+        else:
+            model_config["quantization"] = "none"
+        max_seq_len = getattr(args, "max_seq_len", None)
+        if max_seq_len is not None:
+            model_config["max_model_len"] = str(max_seq_len)
+        try:
+            import torch
+            if torch.cuda.is_available():
+                model_config["gpu_type"] = torch.cuda.get_device_name(0)
+        except (ImportError, RuntimeError) as e:
+            logger.debug("Could not detect GPU type for config metrics: %s", e)
+
+        # Parallel config — prefer parallel_config from generator args
+        # for accurate values including cp_size and world_size.
+        par_cfg = getattr(args, "parallel_config", None)
+        if par_cfg is not None:
+            tp_size = getattr(par_cfg, "tp_size", 1) or 1
+            pp_size = getattr(par_cfg, "pp_size", 1) or 1
+            cp_size = getattr(par_cfg, "cp_size", 1) or 1
+            world_size = getattr(par_cfg, "world_size",
+                                 tp_size * pp_size * cp_size)
+        else:
+            tp_size = getattr(args, "tensor_parallel_size", 1) or 1
+            pp_size = getattr(args, "pipeline_parallel_size", 1) or 1
+            cp_size = 1
+            world_size = tp_size * pp_size * cp_size
+        parallel_config = {
+            "tensor_parallel_size": str(tp_size),
+            "pipeline_parallel_size": str(pp_size),
+            "context_parallel_size": str(cp_size),
+            "gpu_count": str(world_size),
+        }
+        ep_size = getattr(par_cfg, "moe_ep_size", None) if par_cfg else \
+            getattr(args, "moe_expert_parallel_size", None)
+        if ep_size is not None and ep_size > 0:
+            parallel_config["expert_parallel_size"] = str(ep_size)
+
+        # Speculative decoding config
+        spec_config_obj = getattr(args, "speculative_config", None) or getattr(
+            args, "decoding_config", None)
+        speculative_config = None
+        if spec_config_obj is not None:
+            speculative_config = {"spec_enabled": "true"}
+            decoding_type = getattr(spec_config_obj, "decoding_type", None)
+            if decoding_type is not None:
+                speculative_config["spec_method"] = str(decoding_type)
+            max_draft_len = getattr(spec_config_obj, "max_draft_len", None)
+            if max_draft_len is not None:
+                speculative_config["spec_num_tokens"] = str(max_draft_len)
+            draft_model = getattr(spec_config_obj, "speculative_model", None)
+            if draft_model is not None:
+                speculative_config["spec_draft_model"] = str(draft_model)
+
+        # KV cache config
+        kv_cache_config_obj = getattr(args, "kv_cache_config", None)
+        kv_cache_config = None
+        if kv_cache_config_obj is not None:
+            kv_cache_config = {}
+            for field in ("page_size", "enable_block_reuse",
+                          "enable_partial_reuse", "free_gpu_memory_fraction"):
+                val = getattr(kv_cache_config_obj, field, None)
+                if val is not None:
+                    kv_cache_config[field] = str(val)
+            kv_dtype = getattr(kv_cache_config_obj, "dtype", None)
+            if kv_dtype is not None:
+                kv_cache_config["cache_dtype"] = str(kv_dtype)
+
+        self.metrics_collector.log_config_info(
+            model_config=model_config,
+            parallel_config=parallel_config,
+            speculative_config=speculative_config,
+            kv_cache_config=kv_cache_config if kv_cache_config else None,
+        )
 
     async def await_disconnected(self, raw_request: Request, promise):
         if raw_request is None:
@@ -698,7 +893,14 @@ class OpenAIServer:
         if not res.finished:
             return
         if self.metrics_collector:
-            self.metrics_collector.log_request_metrics_dict(res.metrics_dict)
+            if res.candidate_metrics:
+                for candidate_m in res.candidate_metrics:
+                    self.metrics_collector.log_request_metrics_dict(candidate_m)
+            elif res.metrics_dict:
+                # Fallback for paths that populate metrics_dict directly
+                # (e.g. PostprocWorker).
+                self.metrics_collector.log_request_metrics_dict(
+                    res.metrics_dict)
             # Note: Iteration stats are collected by the background _iteration_stats_collector_loop task
             # Wake up the stats collector to drain iteration stats
             if getattr(self.generator.args, "enable_iter_perf_stats", True):
@@ -757,10 +959,13 @@ class OpenAIServer:
         Background task that continuously collects iteration statistics from the LLM engine.
 
         This task runs in the background for the lifetime of the server and drains iteration
-        stats from the engine's stats queue, logging only the latest stats to Prometheus.
-        Since iteration stats are gauges (point-in-time metrics like KV cache hit rate),
-        only the most recent value is needed. This approach avoids blocking request completion
-        while collecting stats and minimizes redundant metric updates.
+        stats from the engine's stats queue, logging every stat to Prometheus.  Gauges
+        (kv_cache_hit_rate, kv_cache_utilization, kv_cache_iter_reuse_rate) are naturally
+        overwritten with the latest value, while counters (missed_blocks_total,
+        gen_alloc_blocks_total, etc.) must be incremented by *every* per-iteration delta
+        to remain accurate.  Logging only the latest stat would drop counter deltas from
+        earlier iterations and could leave gauges unset if the latest iteration had no
+        context-phase activity.
 
         The task sleeps when idle and is woken up via _iteration_stats_wakeup_event when
         requests complete.
@@ -776,17 +981,11 @@ class OpenAIServer:
                 # Clear the event for next wakeup
                 self._iteration_stats_wakeup_event.clear()
 
-                # Drain all available iteration stats from the queue, but only log the latest
-                # Since metrics are gauges (point-in-time values), only the most recent stat matters
+                # Drain all available iteration stats and log each one to Prometheus.
                 try:
-                    latest_stat = None
                     async for llm_stat in self.generator.get_stats_async(
                             timeout=0.5):
-                        latest_stat = llm_stat  # Keep only the latest
-
-                    # Log only the most recent iteration stats to Prometheus
-                    if latest_stat is not None:
-                        self.metrics_collector.log_iteration_stats(latest_stat)
+                        self.metrics_collector.log_iteration_stats(llm_stat)
                 except Exception as e:
                     # Log errors but continue collecting stats
                     logger.error(f"Error collecting iteration stats: {e}",
@@ -855,6 +1054,14 @@ class OpenAIServer:
                 if tool_parser_cls and getattr(
                         tool_parser_cls, 'needs_raw_special_tokens', False):
                     sampling_params.skip_special_tokens = False
+                # When strict=True on any tool, apply constrained decoding
+                # via structural tags (only if response_format doesn't already
+                # set guided decoding).
+                if sampling_params.guided_decoding is None:
+                    strict_guided = _build_tool_strict_guided_decoding_params(
+                        request.tools, self.tool_parser)
+                    if strict_guided is not None:
+                        sampling_params.guided_decoding = strict_guided
             postproc_args = ChatPostprocArgs.from_request(request)
             disaggregated_params = to_llm_disaggregated_params(
                 request.disaggregated_params)
@@ -1109,9 +1316,22 @@ class OpenAIServer:
                     for pp_res in pp_result:
                         yield pp_res
                 await self._extract_metrics(output, raw_request)
-            except:
+            except Exception as e:
                 logger.error(traceback.format_exc())
-                raise
+                # StreamingResponse commits HTTP 200 before the first
+                # chunk, so we cannot change the status code.  Yield
+                # an SSE error event so the stream terminates cleanly
+                # instead of breaking the HTTP connection.
+                error_data = json.dumps({
+                    "error": {
+                        "message": str(e),
+                        "type": "server_error",
+                        "code": None,
+                        "param": None,
+                    }
+                })
+                yield f"data: {error_data}\n\n"
+                yield "data: [DONE]\n\n"
 
         async def merge_generators(generators: List[AsyncIterator[Any]]):
             result_queue = asyncio.Queue()
@@ -1572,22 +1792,16 @@ class OpenAIServer:
                 )
 
             # Build response
-            output_images = output.image
-            MediaStorage.save_image(
-                output_images,
-                self.media_storage_path / f"{image_id}.png",
-            )
-
-            if not isinstance(output_images, list):
-                output_images = [output_images]
+            output_images = _normalize_image_output(output.image)
 
             if request.response_format == "b64_json":
                 data = [
-                    ImageObject(b64_json=base64.b64encode(
-                        MediaStorage.convert_image_to_bytes(image)).decode(
-                            'utf-8'),
-                                revised_prompt=request.prompt)
-                    for image in output_images
+                    ImageObject(
+                        b64_json=base64.b64encode(
+                            MediaStorage.convert_image_to_bytes(image)).decode(
+                                'utf-8'),
+                        revised_prompt=request.prompt,
+                    ) for image in output_images
                 ]
 
                 response = ImageGenerationResponse(
@@ -1597,6 +1811,10 @@ class OpenAIServer:
                 )
 
             elif request.response_format == "url":
+                MediaStorage.save_image(
+                    output_images[0],
+                    self.media_storage_path / f"{image_id}.png",
+                )
                 # TODO: Support URL mode
                 return self._create_not_supported_error(
                     "URL mode is not supported for image generation")
@@ -1639,23 +1857,17 @@ class OpenAIServer:
                 )
 
             # Build response
-            output_images = output.image
-            MediaStorage.save_image(
-                output_images,
-                self.media_storage_path / f"{image_id}.png",
-            )
-
-            if not isinstance(output_images, list):
-                output_images = [output_images]
+            output_images = _normalize_image_output(output.image)
 
             response = ImageGenerationResponse(
                 created=int(time.time()),
                 data=[
-                    ImageObject(b64_json=base64.b64encode(
-                        MediaStorage.convert_image_to_bytes(image)).decode(
-                            'utf-8'),
-                                revised_prompt=request.prompt)
-                    for image in output_images
+                    ImageObject(
+                        b64_json=base64.b64encode(
+                            MediaStorage.convert_image_to_bytes(image)).decode(
+                                'utf-8'),
+                        revised_prompt=request.prompt,
+                    ) for image in output_images
                 ],
                 size=f"{params.width}x{params.height}",
             )

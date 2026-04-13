@@ -56,6 +56,10 @@ class DummyFactory(ModelFactory):
     def get_export_infos(self, model: nn.Module) -> List[SubModuleExportInfo]:
         return [FullModelExportInfo()]
 
+    @property
+    def max_seq_len(self) -> int:
+        return 512
+
 
 # ---------------------------------------------------------------------------
 # Mock model that uses torch_gated_delta_rule
@@ -217,6 +221,7 @@ def test_torch_gated_delta_rule_cache(num_k_heads, num_v_heads):
             cu_seqlen=cu_seqlen,
             input_pos=input_pos,
             slot_idx=list(range(bs)),
+            gather_context_logits=True,
         )
         y = gm(**cm.named_args)
         return torch.stack(cm.info.unnest_sequences(y))

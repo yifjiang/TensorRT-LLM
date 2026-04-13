@@ -10,7 +10,7 @@ import torch
 from typing_extensions import Self
 
 if TYPE_CHECKING:
-    from ..speculative.utils import SpecDecodingTensor
+    from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
     from ..speculative.interface import SpecMetadata
     from ..speculative.spec_tree_manager import SpecTreeManager
 
@@ -174,6 +174,9 @@ class AttentionMetadata:
         assert self.cross is None or type(self) is type(
             self.cross
         ), "Top level and cross attention sub metadata type mismatched"
+
+    def on_update_kv_lens(self):
+        pass
 
     def on_update(self):
         if (self._seq_lens is not None
@@ -380,8 +383,7 @@ class AttentionMetadata:
             max_total_draft_tokens,
             model_is_wrapped: bool = False,
             spec_metadata: Optional['SpecMetadata'] = None,
-            spec_tree_manager: Optional['SpecTreeManager'] = None,
-            spec_decoding_tensor: Optional['SpecDecodingTensor'] = None):
+            spec_tree_manager: Optional['SpecTreeManager'] = None):
         """
         Hook to be called when using TRTLLM attention backend in spec-dec mode.
         """
@@ -474,7 +476,7 @@ class RopeParams:
     short_factor: Optional[Tuple[float]] = None
     long_factor: Optional[Tuple[float]] = None
     max_seq_len: Optional[int] = None
-    duplicate_data: bool = True
+    duplicate_data: bool = False
 
     @staticmethod
     def from_config(config) -> "RopeParams":
@@ -500,10 +502,13 @@ class RopeParams:
                            or getattr(config, 'partial_rotary_factor', None)
                            or 1.0)
         # rotary embedding dim.
+        qk_rope_head_dim = getattr(config, 'qk_rope_head_dim', None)
         rope_params.dim = (getattr(config, 'rotary_dim', None)
                            or getattr(config, 'rotary_emb_base', None)
-                           or getattr(config, 'qk_rope_head_dim', None)
+                           or qk_rope_head_dim
                            or int(head_dim * rope_percentage))
+        if qk_rope_head_dim is not None:
+            rope_params.duplicate_data = True
         # rotary scaling.
         rope_params.scale_type = RotaryScalingType.none
         rope_params.scale = 1.0
@@ -577,6 +582,7 @@ class RopeParams:
                 short_factor=self.short_factor,
                 long_factor=self.long_factor,
                 max_seq_len=self.max_seq_len,
+                duplicate_data=self.duplicate_data,
             )
         else:
             rope_inv_freq, rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
@@ -592,7 +598,9 @@ class RopeParams:
                     "high_freq_factor": self.high_freq_factor,
                     "original_max_position_embeddings":
                     self.original_max_positions,
-                })
+                },
+                duplicate_data=self.duplicate_data,
+            )
         if rope_inv_freq is not None:
             rope_inv_freq = torch.tensor(
                 rope_inv_freq,

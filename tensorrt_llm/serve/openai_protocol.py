@@ -127,6 +127,7 @@ class DisaggregatedParams(OpenAIBaseModel):
     ctx_dp_rank: Optional[int] = None
     ctx_info_endpoint: Optional[str] = None
     schedule_style: Optional[DisaggScheduleStyle] = None
+    conversation_id: Optional[str] = None
 
 
 class ErrorResponse(OpenAIBaseModel):
@@ -508,7 +509,7 @@ class ChatCompletionLogProb(OpenAIBaseModel):
 
 
 class ChatCompletionLogProbsContent(ChatCompletionLogProb):
-    top_logprobs: List[ChatCompletionLogProb] = None
+    top_logprobs: Optional[List[ChatCompletionLogProb]] = None
 
 
 class CustomChatCompletionContentPartParam(TypedDict, total=False):
@@ -618,6 +619,7 @@ class FunctionDefinition(OpenAIBaseModel):
     name: str
     description: Optional[str] = None
     parameters: Optional[Dict[str, Any]] = None
+    strict: Optional[bool] = None
 
 
 class ChatCompletionToolsParam(OpenAIBaseModel):

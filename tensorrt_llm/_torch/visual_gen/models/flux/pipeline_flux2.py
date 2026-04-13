@@ -114,7 +114,10 @@ class Flux2Pipeline(BasePipeline):
     HIDDEN_STATE_LAYERS: Tuple[int, ...] = (10, 20, 30)
 
     def __init__(self, model_config):
-        if model_config.parallel.dit_cfg_size != 1:
+        if (
+            model_config.visual_gen_mapping is not None
+            and model_config.visual_gen_mapping.cfg_size != 1
+        ):
             raise ValueError(
                 "Flux2Pipeline does not support CFG parallelism. Please set dit_cfg_size to 1."
             )
@@ -173,6 +176,9 @@ class Flux2Pipeline(BasePipeline):
     @property
     def default_warmup_num_frames(self):
         return [1]
+
+    def warmup_cache_key(self, height: int, width: int, **kwargs) -> tuple:
+        return (height, width)
 
     def _init_transformer(self) -> None:
         """Initialize FLUX.2 transformer with quantization support."""
@@ -315,6 +321,14 @@ class Flux2Pipeline(BasePipeline):
 
             # Enable TeaCache with FLUX.2-specific polynomial coefficients
             self._setup_teacache(self.transformer, FLUX2_TEACACHE_COEFFICIENTS)
+
+    DEFAULT_GENERATION_PARAMS = {
+        "height": 1024,
+        "width": 1024,
+        "num_inference_steps": 50,
+        "guidance_scale": 3.5,
+        "max_sequence_length": 512,
+    }
 
     def infer(self, req):
         """Run inference from DiffusionRequest."""

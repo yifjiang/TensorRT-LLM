@@ -1159,9 +1159,12 @@ class Deepseekv3MoE(nn.Module):
         # NOTE: define compiled helpers at module scope to avoid defining decorators inside compiled frames
 
         routed_output, shared_output = maybe_execute_in_parallel(
-            _compute_routed_output, _compute_shared_output,
+            _compute_routed_output,
+            _compute_shared_output,
             self.event_dict[EventType.Main],
-            self.event_dict[EventType.MoeShared], self.aux_stream)
+            self.event_dict[EventType.MoeShared],
+            self.aux_stream,
+            disable_on_compile=True)
 
         if not do_finalize:
             return [shared_output, *routed_output]
@@ -1644,6 +1647,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
             self.event_dict[EventType.Main],
             self.event_dict[EventType.MoeShared],
             self.aux_stream,
+            disable_on_compile=True,
         )
         hidden_states = torch.concat([inputs_embeds, hidden_states], dim=-1)
         # Split hidden_states columnwise based on TP
@@ -1784,6 +1788,7 @@ class DeepseekV3Model(DecoderModel):
         return hidden_states
 
 
+@register_auto_model("GlmMoeDsaForCausalLM")
 @register_auto_model("DeepseekV32ForCausalLM")
 @register_auto_model("DeepseekV3ForCausalLM")
 class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
@@ -1818,6 +1823,11 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                 quant_config_dict[key] = val
             model_config._frozen = False
             model_config.quant_config_dict = quant_config_dict
+            model_config._frozen = True
+
+        if model_config.pretrained_config.model_type == 'glm_moe_dsa':
+            model_config._frozen = False
+            model_config.pretrained_config.model_type = 'deepseek_v32'
             model_config._frozen = True
 
         super().__init__(model=DeepseekV3Model(

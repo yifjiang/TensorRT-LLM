@@ -17,6 +17,9 @@
 import glob
 import json
 import os
+import random
+import time
+import urllib.request
 
 import pytest
 import torch
@@ -35,7 +38,7 @@ WAN_T2V_WIDTH = 832
 WAN_T2V_NUM_FRAMES = 165
 
 # LTX-2 configuration
-LTX2_MODEL_SUBPATH = "ltx-video-2-0.9.7"
+LTX2_MODEL_CHECKPOINT_PATH = "LTX-2/ltx-2-19b-dev.safetensors"
 LTX2_TEXT_ENCODER_SUBPATH = "gemma-3-12b-it"
 LTX2_T2V_PROMPT = (
     "A woman with long brown hair and light skin smiles at the camera while "
@@ -109,6 +112,35 @@ VBENCH_LTX2_FP8_GOLDEN_SCORES = {
     "imaging_quality": 0.6546,
 }
 
+# LTX-2 Two-Stage configuration
+LTX2_UPSAMPLER_SUBPATH = "LTX-2/ltx-2-spatial-upscaler-x2-1.0.safetensors"
+LTX2_DISTILLED_LORA_SUBPATH = "LTX-2/ltx-2-19b-distilled-lora-384.safetensors"
+LTX2_TWO_STAGE_HEIGHT = 1024
+LTX2_TWO_STAGE_WIDTH = 1536
+LTX2_TWO_STAGE_NUM_FRAMES = 121
+LTX2_TWO_STAGE_STEPS = 40
+LTX2_TWO_STAGE_GUIDANCE_SCALE = 4.0
+
+# Golden VBench scores for two-stage pipeline variants.
+# Initially None — first CI run is a baseline that prints scores for capture.
+VBENCH_LTX2_TWO_STAGE_BF16_GOLDEN_SCORES = {
+    "subject_consistency": 0.9785,
+    "background_consistency": 0.9498,
+    "motion_smoothness": 0.9894,
+    "dynamic_degree": 1.0,
+    "aesthetic_quality": 0.6165,
+    "imaging_quality": 0.6948,
+}
+
+VBENCH_LTX2_TWO_STAGE_FP8_GOLDEN_SCORES = {
+    "subject_consistency": 0.9820,
+    "background_consistency": 0.9617,
+    "motion_smoothness": 0.9885,
+    "dynamic_degree": 1.0,
+    "aesthetic_quality": 0.6017,
+    "imaging_quality": 0.7136,
+}
+
 VBENCH_REPO = "https://github.com/Vchitect/VBench.git"
 # Pin to a fixed commit for reproducible shallow-fetch
 VBENCH_COMMIT = "98b19513678e99c80d8377fda25ba53b81a491a6"
@@ -116,12 +148,21 @@ VBENCH_COMMIT = "98b19513678e99c80d8377fda25ba53b81a491a6"
 DINO_REPO = "https://github.com/facebookresearch/dino.git"
 DINO_HUB_DIR_NAME = "facebookresearch_dino_main"
 
+AESTHETIC_PREDICTOR_URL = (
+    "https://raw.githubusercontent.com/LAION-AI/aesthetic-predictor/main/sa_0_4_vit_l_14_linear.pth"
+)
+AESTHETIC_PREDICTOR_FILENAME = "sa_0_4_vit_l_14_linear.pth"
+AESTHETIC_PREDICTOR_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "emb_reader")
+
 
 @pytest.fixture(scope="session")
 def _visual_gen_deps(llm_venv):
-    """Install av + diffusers once per session (shared by all video-gen fixtures)."""
+    """Install av + diffusers + ffmpeg once per session (shared by all video-gen fixtures)."""
     llm_venv.run_cmd(["-m", "pip", "install", "av"])
     llm_venv.run_cmd(["-m", "pip", "install", "git+https://github.com/huggingface/diffusers.git"])
+    # Install ffmpeg system package required by MediaStorage.save_video for MP4 encoding
+    check_call(["apt-get", "update", "-y"], shell=False)
+    check_call(["apt-get", "install", "-y", "ffmpeg"], shell=False)
 
 
 @pytest.fixture(scope="session")
@@ -130,6 +171,7 @@ def vbench_repo_root(llm_venv):
     workspace = llm_venv.get_working_directory()
     repo_path = os.path.join(workspace, "VBench_repo")
     _precache_dino_for_torch_hub()
+    _precache_aesthetic_predictor()
     if os.path.exists(repo_path):
         return repo_path
     # Shallow-fetch only the pinned commit to avoid downloading full history (~350 MB)
@@ -185,6 +227,47 @@ def _precache_dino_for_torch_hub():
             ["git", "clone", "--depth", "1", "-b", "main", DINO_REPO, dino_cache],
             shell=False,
         )
+
+
+def _precache_aesthetic_predictor():
+    """Pre-download LAION aesthetic predictor weights to avoid GitHub rate limits.
+
+    VBench's aesthetic_quality dimension downloads sa_0_4_vit_l_14_linear.pth
+    from GitHub via wget at evaluation time.  GitHub often returns HTTP 429
+    (Too Many Requests) in CI environments.  Pre-downloading with retries
+    and proper headers ensures the file is cached before VBench needs it.
+    """
+    os.makedirs(AESTHETIC_PREDICTOR_CACHE_DIR, exist_ok=True)
+    cached_path = os.path.join(AESTHETIC_PREDICTOR_CACHE_DIR, AESTHETIC_PREDICTOR_FILENAME)
+    if os.path.isfile(cached_path):
+        return
+
+    max_retries = 8
+    for attempt in range(max_retries):
+        try:
+            req = urllib.request.Request(
+                AESTHETIC_PREDICTOR_URL,
+                headers={"User-Agent": "TensorRT-LLM-CI/1.0"},
+            )
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                data = resp.read()
+            tmp_path = cached_path + ".tmp"
+            with open(tmp_path, "wb") as f:
+                f.write(data)
+            os.replace(tmp_path, cached_path)
+            return
+        except Exception as exc:
+            if attempt < max_retries - 1:
+                wait = min(10 * 2**attempt, 120) + random.uniform(0, 5)
+                print(
+                    f"[precache] Aesthetic predictor download attempt {attempt + 1}/{max_retries} "
+                    f"failed ({exc}), retrying in {wait:.0f}s..."
+                )
+                time.sleep(wait)
+            else:
+                raise RuntimeError(
+                    f"Failed to download aesthetic predictor after {max_retries} attempts: {exc}"
+                ) from exc
 
 
 @pytest.fixture(scope="session")
@@ -270,12 +353,12 @@ def _generate_ltx2_video(llm_venv, output_subdir, linear_type="default"):
     from tensorrt_llm.serve.media_storage import MediaStorage
 
     scratch_space = conftest.llm_models_root()
-    model_path = os.path.join(scratch_space, LTX2_MODEL_SUBPATH)
+    model_path = os.path.join(scratch_space, LTX2_MODEL_CHECKPOINT_PATH)
     text_encoder_path = os.path.join(scratch_space, LTX2_TEXT_ENCODER_SUBPATH)
-    if not os.path.isdir(model_path):
+    if not os.path.isfile(model_path):
         pytest.skip(
-            f"LTX-2 model not found: {model_path} "
-            f"(set LLM_MODELS_ROOT or place {LTX2_MODEL_SUBPATH} under scratch)"
+            f"LTX-2 checkpoint not found: {model_path} "
+            f"(set LLM_MODELS_ROOT or place {LTX2_MODEL_CHECKPOINT_PATH} under models root)"
         )
     if not os.path.isdir(text_encoder_path):
         pytest.skip(
@@ -296,7 +379,7 @@ def _generate_ltx2_video(llm_venv, output_subdir, linear_type="default"):
         vg_kwargs["parallel"] = {"dit_cfg_size": 2}
 
     diffusion_args = VisualGenArgs(**vg_kwargs)
-    visual_gen = VisualGen(model_path=model_path, diffusion_args=diffusion_args)
+    visual_gen = VisualGen(model=model_path, args=diffusion_args)
 
     try:
         params = VisualGenParams(
@@ -339,6 +422,97 @@ def ltx2_bf16_video_path(_visual_gen_deps, llm_venv):
 def ltx2_fp8_video_path(_visual_gen_deps, llm_venv):
     """Generate LTX-2 FP8 T2V video and return path."""
     return _generate_ltx2_video(llm_venv, "ltx2_fp8", linear_type="trtllm-fp8-per-tensor")
+
+
+def _generate_ltx2_two_stage_video(llm_venv, output_subdir, linear_type="default"):
+    """Generate a two-stage LTX-2 video using the Python API.
+
+    Requires the main checkpoint, text encoder, spatial upsampler, and
+    distilled LoRA.  Returns the path to the generated .mp4, or calls
+    pytest.skip if any asset is missing.
+    """
+    from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams
+    from tensorrt_llm.serve.media_storage import MediaStorage
+
+    scratch_space = conftest.llm_models_root()
+    model_path = os.path.join(scratch_space, LTX2_MODEL_CHECKPOINT_PATH)
+    text_encoder_path = os.path.join(scratch_space, LTX2_TEXT_ENCODER_SUBPATH)
+    upsampler_path = os.path.join(scratch_space, LTX2_UPSAMPLER_SUBPATH)
+    lora_path = os.path.join(scratch_space, LTX2_DISTILLED_LORA_SUBPATH)
+
+    for label, path, is_file in [
+        ("LTX-2 checkpoint", model_path, True),
+        ("text encoder", text_encoder_path, False),
+        ("spatial upsampler", upsampler_path, True),
+        ("distilled LoRA", lora_path, True),
+    ]:
+        exists = os.path.isfile(path) if is_file else os.path.isdir(path)
+        if not exists:
+            pytest.skip(f"Two-stage {label} not found: {path}")
+
+    out_dir = os.path.join(llm_venv.get_working_directory(), "visual_gen_output", output_subdir)
+    os.makedirs(out_dir, exist_ok=True)
+    output_path = os.path.join(out_dir, VISUAL_GEN_OUTPUT_VIDEO)
+    if os.path.isfile(output_path):
+        return output_path
+
+    vg_kwargs = dict(
+        text_encoder_path=text_encoder_path,
+        spatial_upsampler_path=upsampler_path,
+        distilled_lora_path=lora_path,
+    )
+    quant_config = _linear_type_to_quant_config(linear_type)
+    if quant_config is not None:
+        vg_kwargs["quant_config"] = quant_config
+    if torch.cuda.device_count() >= 2:
+        vg_kwargs["parallel"] = {"dit_cfg_size": 2}
+
+    diffusion_args = VisualGenArgs(**vg_kwargs)
+    visual_gen = VisualGen(model=model_path, args=diffusion_args)
+
+    try:
+        params = VisualGenParams(
+            height=LTX2_TWO_STAGE_HEIGHT,
+            width=LTX2_TWO_STAGE_WIDTH,
+            num_frames=LTX2_TWO_STAGE_NUM_FRAMES,
+            num_inference_steps=LTX2_TWO_STAGE_STEPS,
+            guidance_scale=LTX2_TWO_STAGE_GUIDANCE_SCALE,
+            max_sequence_length=LTX2_T2V_MAX_SEQ_LEN,
+            seed=LTX2_T2V_SEED,
+            frame_rate=LTX2_T2V_FRAME_RATE,
+        )
+        output = visual_gen.generate(
+            inputs={
+                "prompt": LTX2_T2V_PROMPT,
+                "negative_prompt": LTX2_T2V_NEGATIVE_PROMPT,
+            },
+            params=params,
+        )
+        MediaStorage.save_video(
+            output.video,
+            output_path,
+            audio=output.audio,
+            frame_rate=LTX2_T2V_FRAME_RATE,
+        )
+    finally:
+        visual_gen.shutdown()
+
+    assert os.path.isfile(output_path), f"LTX-2 two-stage did not produce {output_path}"
+    return output_path
+
+
+@pytest.fixture(scope="session")
+def ltx2_two_stage_bf16_video_path(_visual_gen_deps, llm_venv):
+    """Generate LTX-2 two-stage BF16 T2V video and return path."""
+    return _generate_ltx2_two_stage_video(llm_venv, "ltx2_two_stage_bf16")
+
+
+@pytest.fixture(scope="session")
+def ltx2_two_stage_fp8_video_path(_visual_gen_deps, llm_venv):
+    """Generate LTX-2 two-stage FP8 T2V video and return path."""
+    return _generate_ltx2_two_stage_video(
+        llm_venv, "ltx2_two_stage_fp8", linear_type="trtllm-fp8-per-tensor"
+    )
 
 
 def _normalize_score(val):
@@ -531,6 +705,40 @@ def test_vbench_dimension_score_ltx2_fp8(vbench_repo_root, ltx2_fp8_video_path, 
         llm_venv,
         title="LTX-2 FP8",
         golden_scores=VBENCH_LTX2_FP8_GOLDEN_SCORES,
+        max_score_diff=0.05,
+    )
+
+
+def test_vbench_dimension_score_ltx2_two_stage_bf16(
+    vbench_repo_root, ltx2_two_stage_bf16_video_path, llm_venv
+):
+    """VBench accuracy for LTX-2 two-stage BF16 T2V."""
+    videos_dir = os.path.dirname(ltx2_two_stage_bf16_video_path)
+    assert os.path.isfile(ltx2_two_stage_bf16_video_path), "LTX-2 two-stage BF16 video must exist"
+    _run_vbench_and_report(
+        vbench_repo_root,
+        videos_dir,
+        VISUAL_GEN_OUTPUT_VIDEO,
+        llm_venv,
+        title="LTX-2 Two-Stage BF16",
+        golden_scores=VBENCH_LTX2_TWO_STAGE_BF16_GOLDEN_SCORES,
+        max_score_diff=0.05,
+    )
+
+
+def test_vbench_dimension_score_ltx2_two_stage_fp8(
+    vbench_repo_root, ltx2_two_stage_fp8_video_path, llm_venv
+):
+    """VBench accuracy for LTX-2 two-stage FP8 T2V."""
+    videos_dir = os.path.dirname(ltx2_two_stage_fp8_video_path)
+    assert os.path.isfile(ltx2_two_stage_fp8_video_path), "LTX-2 two-stage FP8 video must exist"
+    _run_vbench_and_report(
+        vbench_repo_root,
+        videos_dir,
+        VISUAL_GEN_OUTPUT_VIDEO,
+        llm_venv,
+        title="LTX-2 Two-Stage FP8",
+        golden_scores=VBENCH_LTX2_TWO_STAGE_FP8_GOLDEN_SCORES,
         max_score_diff=0.05,
     )
 

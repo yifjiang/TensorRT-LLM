@@ -45,7 +45,10 @@ class FluxPipeline(BasePipeline):
     """
 
     def __init__(self, model_config):
-        if model_config.parallel.dit_cfg_size != 1:
+        if (
+            model_config.visual_gen_mapping is not None
+            and model_config.visual_gen_mapping.cfg_size != 1
+        ):
             raise ValueError(
                 "FluxPipeline does not support CFG parallelism. Please set dit_cfg_size to 1."
             )
@@ -105,6 +108,9 @@ class FluxPipeline(BasePipeline):
     @property
     def default_warmup_num_frames(self):
         return [1]
+
+    def warmup_cache_key(self, height: int, width: int, **kwargs) -> tuple:
+        return (height, width)
 
     def _init_transformer(self) -> None:
         """Initialize FLUX transformer with quantization support."""
@@ -222,6 +228,14 @@ class FluxPipeline(BasePipeline):
 
             # Enable TeaCache with FLUX.1-specific polynomial coefficients
             self._setup_teacache(self.transformer, FLUX_TEACACHE_COEFFICIENTS)
+
+    DEFAULT_GENERATION_PARAMS = {
+        "height": 1024,
+        "width": 1024,
+        "num_inference_steps": 50,
+        "guidance_scale": 3.5,
+        "max_sequence_length": 512,
+    }
 
     def infer(self, req):
         """Run inference from DiffusionRequest."""

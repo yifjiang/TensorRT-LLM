@@ -14,8 +14,9 @@ from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BatchingType,
                        ExtendedRuntimePerfKnobConfig, KvCacheConfig, LlmArgs,
                        LookaheadDecodingConfig, MedusaDecodingConfig, MoeConfig,
                        MTPDecodingConfig, NGramDecodingConfig,
-                       PARDDecodingConfig, RocketSparseAttentionConfig,
-                       SADecodingConfig, SaveHiddenStatesDecodingConfig,
+                       PARDDecodingConfig, PrometheusMetricsConfig,
+                       RocketSparseAttentionConfig, SADecodingConfig,
+                       SAEnhancerConfig, SaveHiddenStatesDecodingConfig,
                        SchedulerConfig, SkipSoftmaxAttentionConfig,
                        TorchCompileConfig, TorchLlmArgs, TrtLlmArgs,
                        UserProvidedDecodingConfig)
@@ -23,13 +24,10 @@ from .llm_utils import (BuildConfig, KvCacheRetentionConfig, QuantAlgo,
                         QuantConfig)
 from .mm_encoder import MultimodalEncoder
 from .mpi_session import MpiCommSession
-from .visual_gen import VisualGen, VisualGenParams
 
 __all__ = [
     'LLM',
     'AsyncLLM',
-    'VisualGen',
-    'VisualGenParams',
     'MultimodalEncoder',
     'CompletionOutput',
     'RequestOutput',
@@ -63,6 +61,7 @@ __all__ = [
     'NGramDecodingConfig',
     'PARDDecodingConfig',
     'SADecodingConfig',
+    'SAEnhancerConfig',
     'UserProvidedDecodingConfig',
     'TorchCompileConfig',
     'DraftTargetDecodingConfig',
@@ -76,4 +75,5 @@ __all__ = [
     'RocketSparseAttentionConfig',
     'DeepSeekSparseAttentionConfig',
     'SkipSoftmaxAttentionConfig',
+    'PrometheusMetricsConfig',
 ]
