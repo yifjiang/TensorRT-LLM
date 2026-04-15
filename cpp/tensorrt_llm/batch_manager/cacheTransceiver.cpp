@@ -597,22 +597,32 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                         }
                         if (shouldTimeout)
                         {
-                            TLLM_LOG_ERROR(
-                                "Context KV cache transfer for request %ld exceeded total timeout: "
-                                "elapsed %ld ms > limit %d ms (startTimeValid=%d). Marking as error.",
-                                request->mRequestId, elapsedMs,
-                                kvTransferTimeoutMs.value(), startTimeValid ? 1 : 0);
-                            try
+                            if (startTimeValid)
                             {
-                                mCacheSender->cancelRequest(*request);
+                                TLLM_LOG_ERROR(
+                                    "Context KV cache transfer for request %ld exceeded total timeout: "
+                                    "elapsed %ld ms > limit %d ms. Marking as error.",
+                                    request->mRequestId, elapsedMs, kvTransferTimeoutMs.value());
+                                try
+                                {
+                                    mCacheSender->cancelRequest(*request);
+                                }
+                                catch (...)
+                                {
+                                }
+                                request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                                requestsStatus.errorRequestIds.insert(request->mRequestId);
                             }
-                            catch (std::exception const& e)
+                            else
                             {
-                                TLLM_LOG_WARNING("Best-effort cancel failed for request %ld: %s",
-                                    request->mRequestId, e.what());
+                                // Start time is epoch — the LlmRequest* is likely a dangling pointer
+                                // (request was freed while still in mSenderFutures). Do NOT dereference
+                                // request beyond this point. Just remove the stale entry.
+                                TLLM_LOG_WARNING(
+                                    "Removing stale entry from mSenderFutures: transfer start time is "
+                                    "uninitialized (request pointer %p may be dangling).",
+                                    static_cast<void const*>(request));
                             }
-                            request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
-                            requestsStatus.errorRequestIds.insert(request->mRequestId);
                             it = mSenderFutures.erase(it);
                             continue;
                         }
@@ -633,10 +643,26 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
             }
             catch (std::exception const& e)
             {
-                TLLM_LOG_ERROR(
-                    "Error occurred during context transfer for request %ld: %s", request->mRequestId, e.what());
-                request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
-                requestsStatus.errorRequestIds.insert(request->mRequestId);
+                // Guard: the request pointer may be stale if the sender thread crashed
+                // and the request was freed concurrently. Check transfer start time as
+                // a heuristic — epoch (0) indicates likely dangling pointer.
+                auto transferStart = request->getKvCacheTransferStart();
+                bool likelyValid = transferStart.time_since_epoch().count() > 0;
+                if (likelyValid)
+                {
+                    TLLM_LOG_ERROR(
+                        "Error occurred during context transfer for request %ld: %s",
+                        request->mRequestId, e.what());
+                    request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                    requestsStatus.errorRequestIds.insert(request->mRequestId);
+                }
+                else
+                {
+                    TLLM_LOG_WARNING(
+                        "Error during context transfer with likely stale request pointer %p: %s. "
+                        "Removing entry without setting state.",
+                        static_cast<void const*>(request), e.what());
+                }
                 it = mSenderFutures.erase(it);
             }
         }
