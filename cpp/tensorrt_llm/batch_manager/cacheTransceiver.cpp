@@ -502,6 +502,24 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
         kvTransferTimeoutMs = mCacheTransceiverConfig->getKvTransferTimeoutMs();
     }
 
+    // Log mSenderFutures state for diagnosing dangling pointer issues.
+    // Each entry's pointer address and request ID are logged so we can detect
+    // when a pointer's underlying memory is freed (reqId changes to 0).
+    if (!mSenderFutures.empty())
+    {
+        TLLM_LOG_DEBUG("checkContextTransferStatus: mSenderFutures.size()=%zu, blockAll=%d, "
+            "kvTransferTimeoutMs=%d",
+            mSenderFutures.size(), blockAll ? 1 : 0,
+            kvTransferTimeoutMs.value_or(-1));
+        for (size_t i = 0; i < mSenderFutures.size(); ++i)
+        {
+            auto& [req, fut] = mSenderFutures[i];
+            auto startTs = req->getKvCacheTransferStart().time_since_epoch().count();
+            TLLM_LOG_DEBUG("  [%zu] ptr=%p reqId=%ld startTs=%ld",
+                i, static_cast<void const*>(req), req->mRequestId, static_cast<long>(startTs));
+        }
+    }
+
     auto syncComm = mCacheState->getParallelConfig().mEnableAttentionDP ? mGroupTPInDPComm : mGroupTensorParaComm;
     std::vector<LlmRequest::RequestIdType> contextCompleteRequestIds;
     for (auto&& [request, future] : mSenderFutures)
@@ -670,6 +688,15 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
         {
             ++it;
         }
+    }
+
+    if (!requestsStatus.completedRequestIds.empty() || !requestsStatus.errorRequestIds.empty())
+    {
+        TLLM_LOG_DEBUG("checkContextTransferStatus done: completed=%zu, errors=%zu, "
+            "mSenderFutures.size()=%zu",
+            requestsStatus.completedRequestIds.size(),
+            requestsStatus.errorRequestIds.size(),
+            mSenderFutures.size());
     }
 
     return requestsStatus;
