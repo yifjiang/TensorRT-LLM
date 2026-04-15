@@ -485,11 +485,17 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
 {
     bool blockAll = !atLeastRequestNum.has_value();
     std::optional<int> senderFutureTimeoutMs = std::nullopt;
+    std::optional<int> kvTransferTimeoutMs = std::nullopt;
     // Always use a bounded timeout to prevent unbounded blocking.
     // The caller (scheduler) loops, so timed-out transfers retry on next iteration.
     if (mCacheTransceiverConfig.has_value())
     {
         senderFutureTimeoutMs = mCacheTransceiverConfig->getKvTransferSenderFutureTimeoutMs();
+        kvTransferTimeoutMs = mCacheTransceiverConfig->getKvTransferTimeoutMs();
+    }
+    {
+        senderFutureTimeoutMs = mCacheTransceiverConfig->getKvTransferSenderFutureTimeoutMs();
+        kvTransferTimeoutMs = mCacheTransceiverConfig->getKvTransferTimeoutMs();
     }
 
     auto syncComm = mCacheState->getParallelConfig().mEnableAttentionDP ? mGroupTPInDPComm : mGroupTensorParaComm;
@@ -566,8 +572,37 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                 }
                 else if (status == std::future_status::timeout)
                 {
-                    TLLM_LOG_WARNING(
-                        "Timed out waiting for context KV cache transfer after %d milliseconds.", timeoutMs);
+                    // Check if total elapsed time exceeds kv_transfer_timeout_ms.
+                    // Without this, stuck transfers retry the per-iteration timeout forever,
+                    // holding KV blocks indefinitely and exhausting the cache pool.
+                    if (kvTransferTimeoutMs.has_value())
+                    {
+                        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            LlmRequest::getSteadyClockNow() - request->getKvCacheTransferStart());
+                        if (elapsed.count() > kvTransferTimeoutMs.value())
+                        {
+                            TLLM_LOG_ERROR(
+                                "Context KV cache transfer for request %ld exceeded total timeout: "
+                                "elapsed %ld ms > limit %d ms. Marking as error.",
+                                request->mRequestId, static_cast<long>(elapsed.count()),
+                                kvTransferTimeoutMs.value());
+                            try
+                            {
+                                mCacheSender->cancelRequest(*request);
+                            }
+                            catch (std::exception const& e)
+                            {
+                                TLLM_LOG_WARNING("Best-effort cancel failed for request %ld: %s",
+                                    request->mRequestId, e.what());
+                            }
+                            request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                            requestsStatus.errorRequestIds.insert(request->mRequestId);
+                            it = mSenderFutures.erase(it);
+                            continue;
+                        }
+                    }
+                    TLLM_LOG_WARNING("Timed out waiting for context KV cache transfer after %d milliseconds.",
+                        timeoutMs);
                     ++it;
                 }
                 else
