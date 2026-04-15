@@ -339,6 +339,10 @@ void CacheTransceiver::respondAndSendAsync(LlmRequest* llmRequest)
     }
     setContextState(llmRequest);
     auto future = mCacheSender->sendAsync(*llmRequest);
+    TLLM_LOG_DEBUG("respondAndSendAsync: adding request %ld to mSenderFutures (ptr=%p, transferStart=%ld, size=%zu)",
+        llmRequest->mRequestId, static_cast<void*>(llmRequest),
+        static_cast<long>(llmRequest->getKvCacheTransferStart().time_since_epoch().count()),
+        mSenderFutures.size() + 1);
     mSenderFutures.emplace_back(llmRequest, std::move(future));
 }
 
@@ -577,15 +581,27 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                     // holding KV blocks indefinitely and exhausting the cache pool.
                     if (kvTransferTimeoutMs.has_value())
                     {
-                        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            LlmRequest::getSteadyClockNow() - request->getKvCacheTransferStart());
-                        if (elapsed.count() > kvTransferTimeoutMs.value())
+                        auto transferStart = request->getKvCacheTransferStart();
+                        // Guard: if transfer start was never set (TimePoint epoch),
+                        // the request pointer may be stale or the start time was not recorded.
+                        // Treat as timed out immediately to avoid infinite retry.
+                        bool startTimeValid = transferStart.time_since_epoch().count() > 0;
+                        bool shouldTimeout = !startTimeValid;
+                        long elapsedMs = 0;
+                        if (startTimeValid)
+                        {
+                            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                LlmRequest::getSteadyClockNow() - transferStart);
+                            elapsedMs = static_cast<long>(elapsed.count());
+                            shouldTimeout = elapsedMs > kvTransferTimeoutMs.value();
+                        }
+                        if (shouldTimeout)
                         {
                             TLLM_LOG_ERROR(
                                 "Context KV cache transfer for request %ld exceeded total timeout: "
-                                "elapsed %ld ms > limit %d ms. Marking as error.",
-                                request->mRequestId, static_cast<long>(elapsed.count()),
-                                kvTransferTimeoutMs.value());
+                                "elapsed %ld ms > limit %d ms (startTimeValid=%d). Marking as error.",
+                                request->mRequestId, elapsedMs,
+                                kvTransferTimeoutMs.value(), startTimeValid ? 1 : 0);
                             try
                             {
                                 mCacheSender->cancelRequest(*request);
