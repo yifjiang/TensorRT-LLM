@@ -3638,7 +3638,13 @@ class PyExecutor:
                 # If partial reuse is enabled, and the KV cache manager is not VSWA, and the PP size is 1,
                 # then we need to terminate the request. TODO: Remove this once disagg support from KVCache reuse
                 # path is fixed.
-                if request.is_disagg_context_transmission_state:
+                if request.is_disagg_context_complete_state:
+                    # Already terminated (or attempted) by
+                    # _check_disagg_ctx_cache_transfer_status; re-terminating
+                    # here would cause a double free in resource_manager
+                    # (nvbug/5961736).
+                    pass
+                elif request.is_disagg_context_transmission_state:
                     # Request is still transferring KV cache to the decode worker.
                     # Do NOT terminate — the C++ CacheTransceiver still holds a raw
                     # pointer to this request in mSenderFutures. Terminating now
