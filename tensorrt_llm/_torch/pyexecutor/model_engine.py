@@ -2237,6 +2237,74 @@ class PyTorchModelEngine(ModelEngine):
                 num_accepted_tokens_device, req_id_to_old_request,
                 resource_manager)
 
+        # Guard against scheduler over-admission (issue #13318).
+        #
+        # The MicroBatchScheduler admits a batch using a reuse-discounted
+        # token budget: for a last-chunk context request with `reusable > 0`
+        # it charges only `max(0, context_remaining - reusable)` tokens
+        # (see `_reuse_adjusted_compute` in scheduler/scheduler.py and the
+        # matching C++ logic). The forward pass below, however, extends
+        # `position_ids` by the full `context_chunk_size` per context request
+        # regardless of reuse (the reusable prefix still needs its position
+        # embeddings computed). When `max_num_tokens` is tight, this
+        # mismatch lets `len(position_ids)` overshoot `self.max_num_tokens`
+        # by up to `min(chunk_size, reusable)` per offending request, which
+        # trips the assertion a few lines below and kills the event loop
+        # thread (see issue #13318).
+        #
+        # Pre-compute the predicted `position_ids` growth using the same
+        # accounting the loops below will use, and shrink the trailing
+        # context chunk(s) to fit. `isLastContextChunk()` /
+        # `isFirstContextChunk()` are live-derived from
+        # `context_current_position`, `context_chunk_size`, and
+        # `prompt_len` — mutating `context_chunk_size` here automatically
+        # de-promotes a "last" chunk back to "middle" for this iteration,
+        # and the next scheduler tick picks up the remaining tokens via
+        # the normal chunked-prefill progression. KV cache allocated by
+        # `prepare_resources` for the original chunk size stays reserved
+        # and is reclaimed when the request eventually finishes.
+        if self.max_num_tokens is not None:
+            predicted_ctx_tokens = sum(
+                req.context_chunk_size
+                for req in scheduled_requests.context_requests)
+            # Each generation request extends `position_ids` by
+            # `1 + num_draft_tokens`. The gen loop below uses either
+            # `get_draft_token_length(req)` (extend path) or
+            # `self.runtime_draft_len` (plain gen / first-draft path), so
+            # take the larger of the two to stay conservative — a slight
+            # overestimate only causes us to trim a little earlier, never
+            # fails to catch a real overshoot.
+            predicted_gen_tokens = sum(
+                1 + max(get_draft_token_length(req), self.runtime_draft_len)
+                for req in scheduled_requests.generation_requests)
+            predicted_total = predicted_ctx_tokens + predicted_gen_tokens
+            if predicted_total > self.max_num_tokens:
+                overshoot = predicted_total - self.max_num_tokens
+                for req in reversed(scheduled_requests.context_requests):
+                    if overshoot <= 0:
+                        break
+                    if req.context_chunk_size <= 1:
+                        continue
+                    trim = min(overshoot, req.context_chunk_size - 1)
+                    new_size = req.context_chunk_size - trim
+                    logger.warning(
+                        "[issue-13318] Scheduler over-admitted by "
+                        "%d token(s); trimming context chunk for request "
+                        "%s: chunk_size %d -> %d",
+                        overshoot, req.py_request_id,
+                        req.context_chunk_size, new_size,
+                    )
+                    req.context_chunk_size = new_size
+                    overshoot -= trim
+                if overshoot > 0:
+                    # Could not trim enough (e.g. every chunk already at 1
+                    # and generation traffic alone exceeds max_num_tokens).
+                    # Let the assertion below fire so the condition stays
+                    # observable rather than silently corrupting state.
+                    logger.error(
+                        "[issue-13318] Residual overshoot of %d token(s) "
+                        "after trimming; assertion will fire.", overshoot)
+
         # if new_tensors_device exist, input_ids will only contain new context tokens
         input_ids = []  # per sequence
         sequence_lengths = []  # per sequence
