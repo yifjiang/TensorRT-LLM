@@ -524,7 +524,7 @@ class PyExecutor:
         self._disagg_pp_termination_handler = None
         if self.dist.pp_size > 1 and self.enable_kv_cache_reuse and self.kv_cache_transceiver:
             self._disagg_pp_termination_handler = DisaggPPTerminationHandler(
-                self.dist, self._do_terminate_request)
+                self.dist, self._do_terminate_request_if_safe)
 
         if self.dist.pp_size > 1:
             self.event_loop = self._executor_loop_pp
@@ -3369,10 +3369,17 @@ class PyExecutor:
                        requests: Optional[List[LlmRequest]] = None):
         error_responses: Dict[int, LlmResponse] = {}
         error_msg = error_msg or "error"
-        failed_requests = requests if requests is not None else self.active_requests
+        if requests is None and self._has_inflight_generation_transfers(
+                self.active_requests):
+            self._fail_closed_for_inflight_generation_transfer(error_msg)
+            return
+
+        failed_requests = list(
+            requests if requests is not None else self.active_requests)
         for request in failed_requests:
             req_id = request.py_request_id
-            request.state = LlmRequestState.GENERATION_COMPLETE
+            if not request.is_disagg_context_transmission_state:
+                request.state = LlmRequestState.GENERATION_COMPLETE
             error_responses[req_id] = LlmResponse(
                 request_id=req_id,
                 error_msg=error_msg,
@@ -3388,7 +3395,58 @@ class PyExecutor:
         for request in failed_requests:
             self._terminate_request(request)
 
-    def _terminate_request(self, request: LlmRequest):
+    def _has_inflight_generation_transfers(self,
+                                           requests: Iterable[LlmRequest]
+                                           ) -> bool:
+        return any(req.is_disagg_generation_transmission_in_progress
+                   for req in requests)
+
+    def _fail_closed_for_inflight_generation_transfer(self, error_msg: str):
+        failed_requests = list(self.active_requests)
+        in_flight_req_ids = [
+            req.py_request_id for req in failed_requests
+            if req.is_disagg_generation_transmission_in_progress
+        ]
+        logger.error(
+            "Fatal executor error while disaggregated generation KV transfer is in flight. "
+            "Failing closed without freeing active request resources. "
+            f"in_flight_generation_request_ids={in_flight_req_ids}, error={error_msg}"
+        )
+
+        error_responses: Dict[int, LlmResponse] = {}
+        for request in failed_requests:
+            req_id = request.py_request_id
+            error_responses[req_id] = LlmResponse(
+                request_id=req_id,
+                error_msg=error_msg,
+                client_id=request.py_client_id)
+
+        self.active_requests.clear()
+        self.waiting_queue.clear()
+        self.request_accumulated.clear()
+        self.control_requests.clear()
+        self.is_shutdown = True
+        self._enqueue_responses(list(error_responses.items()))
+        with self.response_cv:
+            self.response_cv.notify_all()
+
+    def _can_terminate_request_now(self, request: LlmRequest) -> bool:
+        if request.is_disagg_context_transmission_state:
+            logger.warning(
+                f"Deferring termination for request {request.py_request_id} "
+                "because context KV transfer is still in progress")
+            return False
+        return True
+
+    def _do_terminate_request_if_safe(self, request: LlmRequest) -> bool:
+        if not self._can_terminate_request_now(request):
+            return False
+        self._do_terminate_request(request)
+        return True
+
+    def _terminate_request(self, request: LlmRequest) -> bool:
+        if not self._can_terminate_request_now(request):
+            return False
         # Dummy requests don't participate in disagg KV cache transfers,
         # so they must bypass the PP termination handler to avoid stale
         # sequences in the KV cache manager (the handler delays removal,
@@ -3398,6 +3456,7 @@ class PyExecutor:
             self._disagg_pp_termination_handler.terminate(request)
         else:
             self._do_terminate_request(request)
+        return True
 
     def _do_terminate_request(self, request: LlmRequest):
         self.resource_manager.free_resources(request)
@@ -3621,11 +3680,14 @@ class PyExecutor:
                 if request.is_disagg_context_complete_state:
                     # Transfer completion already handled cleanup for this request.
                     pass
+                elif request.is_disagg_context_transmission_state:
+                    # AsyncTransferManager still owns the transfer lifetime.
+                    # Cleanup will run from _end_transfer_and_maybe_terminate().
+                    pass
                 elif self.enable_partial_reuse_for_disagg and not self.kv_cache_manager.is_vswa and self.dist.pp_size == 1:
                     requests_to_terminate.append(request)
                 else:
-                    if not request.is_disagg_context_transmission_state:
-                        requests_to_terminate.append(request)
+                    requests_to_terminate.append(request)
             else:
                 new_active_requests.append(request)
 
