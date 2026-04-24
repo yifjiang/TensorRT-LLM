@@ -3618,7 +3618,10 @@ class PyExecutor:
                 # If partial reuse is enabled, and the KV cache manager is not VSWA, and the PP size is 1,
                 # then we need to terminate the request. TODO: Remove this once disagg support from KVCache reuse
                 # path is fixed.
-                if self.enable_partial_reuse_for_disagg and not self.kv_cache_manager.is_vswa and self.dist.pp_size == 1:
+                if request.is_disagg_context_complete_state:
+                    # Transfer completion already handled cleanup for this request.
+                    pass
+                elif self.enable_partial_reuse_for_disagg and not self.kv_cache_manager.is_vswa and self.dist.pp_size == 1:
                     requests_to_terminate.append(request)
                 else:
                     if not request.is_disagg_context_transmission_state:
