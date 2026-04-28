@@ -191,6 +191,10 @@ public:
         auto itr = mNextNodes.find(nkey);
         if (itr != mNextNodes.end())
         {
+            // Make sure the edge removal is bidirectional: once the parent discards this child,
+            // the child must not try to find the parent anymore.
+            // This is crucial for preventing the cascade-prune assertion from firing.
+            itr->second->setPrevNode(NodePtr{});
             mNextNodes.erase(itr);
             auto const isRoot = mPrevNode.expired();
             auto const canBeDeleted = !isRoot && mValue.empty() && mNextNodes.empty();
