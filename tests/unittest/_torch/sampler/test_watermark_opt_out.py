@@ -36,7 +36,12 @@ _MIXED_FLAGS = (True, False, True, False)
 @pytest.fixture
 def filtered_logits() -> torch.Tensor:
     generator = torch.Generator(device="cuda").manual_seed(20261110)
-    return torch.randn((_NUM_ROWS, _VOCAB_SIZE), generator=generator, device="cuda") * 0.2
+    return (
+        torch.randn(
+            (_NUM_ROWS, _VOCAB_SIZE), generator=generator, device="cuda", dtype=torch.float32
+        )
+        * 0.2
+    )
 
 
 def _make_sampler(
@@ -107,7 +112,7 @@ def test_filtered_mixed_opt_out_preserves_native_seeded_stream(filtered_logits, 
 @pytest.mark.parametrize("return_probs", [False, True])
 @pytest.mark.parametrize("all_enabled", [False, True])
 def test_filtered_repeat_fallback_preserves_marked_native_draw(
-    filtered_logits, return_probs, all_enabled
+    filtered_logits, return_probs, all_enabled, record_property
 ):
     flags = (True,) * _NUM_ROWS if all_enabled else _MIXED_FLAGS
     sampler, requests = _make_sampler(WatermarkConfig(key=99), flags)
@@ -115,30 +120,56 @@ def test_filtered_repeat_fallback_preserves_marked_native_draw(
     assert handler is not None
     slots = torch.arange(_NUM_ROWS, device="cuda", dtype=torch.int64)
     enabled = torch.tensor(flags, device="cuda", dtype=torch.bool)
-    # Committing token10 keeps the initial tail unchanged and records that
-    # context, so the next marked position must use its native fallback.
-    rows = handler.plan(slots, enabled)
-    handler.commit(rows, torch.full((_NUM_ROWS,), 10, device="cuda", dtype=torch.int32))
+    # Committing token 10 keeps the tail unchanged, so the next marked
+    # position repeats its context. Prior draws advance the native stream too.
+    for _ in range(3):
+        rows = handler.plan(slots, enabled)
+        handler.commit(rows, torch.full((_NUM_ROWS,), 10, device="cuda", dtype=torch.int32))
+        sampler._seed_manager.take_row_seeds(list(range(_NUM_ROWS)), device=filtered_logits.device)
     next_rows = handler.plan(slots, enabled)
     assert not next_rows.active.any().item()
+    assert torch.equal(
+        sampler._seed_manager._offsets, torch.full((_NUM_ROWS,), 3, dtype=torch.int64)
+    )
 
     temperature, top_k, top_p, min_p = sampler._slot_params.gather(slots)
     seeds = torch.arange(431, 435, device="cuda", dtype=torch.int64)
-    offsets = torch.zeros(_NUM_ROWS, device="cuda", dtype=torch.int64)
+    offsets = torch.full((_NUM_ROWS,), 3, device="cuda", dtype=torch.int64)
     native_args = (filtered_logits, temperature, top_k, top_p, min_p)
     paired_tokens, paired_probs = fused_sample_from_logits_with_probs(
         *native_args, seed=seeds, offset=offsets
     )
     stock_tokens = fused_sample_from_logits(*native_args, seed=seeds, offset=offsets)
+    record_property("native_oracle_offset", 3)
+    record_property("native_tokens_only", str(stock_tokens.cpu().tolist()))
+    record_property("native_with_probs", str(paired_tokens.cpu().tolist()))
+    record_property(
+        "native_oracle_distinct_rows",
+        str((stock_tokens != paired_tokens).nonzero().flatten().cpu().tolist()),
+    )
     actual, actual_probs, _ = sampler._sample_fused(
         filtered_logits, list(range(_NUM_ROWS)), return_probs=return_probs
     )
-    torch.testing.assert_close(actual[enabled], paired_tokens[enabled], rtol=0, atol=0)
+    torch.testing.assert_close(
+        actual[enabled],
+        paired_tokens[enabled],
+        rtol=0,
+        atol=0,
+        msg="Marked repeated-context fallback changed its native draw",
+    )
     if return_probs:
         torch.testing.assert_close(actual[~enabled], paired_tokens[~enabled], rtol=0, atol=0)
         torch.testing.assert_close(actual_probs, paired_probs)
     else:
-        torch.testing.assert_close(actual[~enabled], stock_tokens[~enabled], rtol=0, atol=0)
+        torch.testing.assert_close(
+            actual[~enabled],
+            stock_tokens[~enabled],
+            rtol=0,
+            atol=0,
+            msg="Opt-out repeat fallback changed the native seeded stream",
+        )
         assert actual_probs is None
-    assert torch.equal(sampler._seed_manager._offsets, torch.ones(_NUM_ROWS, dtype=torch.int64))
+    assert torch.equal(
+        sampler._seed_manager._offsets, torch.full((_NUM_ROWS,), 4, dtype=torch.int64)
+    )
     assert len(requests) == _NUM_ROWS

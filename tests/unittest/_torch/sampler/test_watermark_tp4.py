@@ -6,6 +6,8 @@ Each engine runs in a fresh subprocess. The reference repeats the same prompts
 at the same generation stages: a warm KV-cache hit need not reproduce the cold
 request's bf16 logits. Set TRTLLM_WATERMARK_TP4_MODEL to override the model and
 TRTLLM_WATERMARK_TP4_OUTPUT_DIR to retain all raw outputs and detector scores.
+Batch and streaming ensembles use the same 0.001 detection threshold. Every
+sample's score is retained; at least half of each marked ensemble must detect.
 """
 
 from __future__ import annotations
@@ -175,12 +177,23 @@ def _worker(mode: str, model: str, destination: Path) -> None:
             print(f"WATERMARK_TP4_STAGE mode={mode} stage={stage}", flush=True)
 
         async def stream() -> None:
-            params = _params(17, watermarking=True if config is not None else False)
-            result["sampling_parameters"]["streaming"] = [_sampling_record(params, 0)]
-            result["streaming"] = {"chunks": 0, "output": None}
-            async for output in llm.generate_async(prompts[0], params, streaming=True):
-                result["streaming"]["chunks"] += 1
-                result["streaming"]["output"] = _pack(output)
+            result["streaming_samples"] = []
+            result["sampling_parameters"]["streaming_samples"] = []
+            for index, prompt in enumerate(prompts):
+                params = _params(17 + index, watermarking=True if config is not None else False)
+                sample = {"prompt_index": index, "chunks": 0, "output": None}
+                result["streaming_samples"].append(sample)
+                result["sampling_parameters"]["streaming_samples"].append(
+                    _sampling_record(params, index)
+                )
+                if index == 0:
+                    result["streaming"] = sample
+                    result["sampling_parameters"]["streaming"] = [_sampling_record(params, 0)]
+                async for output in llm.generate_async(prompt, params, streaming=True):
+                    sample["chunks"] += 1
+                    sample["output"] = _pack(output)
+                result["last_completed_stage"] = f"streaming_{index}"
+                _save(path, result)
 
         asyncio.run(stream())
         result["last_completed_stage"] = "streaming"
@@ -205,6 +218,7 @@ def _detections(config: object, rows: list[dict]) -> list[dict]:
         dataclasses.asdict(
             detector.detect(row["token_ids"], prompt_token_ids=row["prompt_token_ids"])
         )
+        | {"p_value_threshold": _P_VALUE_THRESHOLD}
         for row in rows
     ]
 
@@ -278,7 +292,14 @@ def test_watermark_tp4_mixed_opt_out_and_streaming(tmp_path: Path) -> None:
             )
 
     baseline = json.loads((output / "baseline/RESULT.json").read_text())
-    assessment = {"modes": {}, "checks": {}}
+    assessment = {
+        "modes": {},
+        "checks": {},
+        "p_value_thresholds": {
+            "batch_ensemble": _P_VALUE_THRESHOLD,
+            "streaming_ensemble": _P_VALUE_THRESHOLD,
+        },
+    }
     for mode in _MODES[1:]:
         raw = json.loads((output / mode / "RESULT.json").read_text())
         checks = {}
@@ -287,9 +308,11 @@ def test_watermark_tp4_mixed_opt_out_and_streaming(tmp_path: Path) -> None:
         checks["mixed_optout_matches_warm_reference"] = all(
             raw["mixed"][index] == baseline["mixed"][index] for index in (1, 3)
         )
-        checks["streamed_final_tokens_complete"] = (
-            raw["streaming"]["chunks"] > 1
-            and len(raw["streaming"]["output"]["token_ids"]) == _MAX_TOKENS
+        checks["streamed_final_tokens_complete"] = len(raw["streaming_samples"]) == len(
+            _PROMPTS
+        ) and all(
+            sample["chunks"] > 1 and len(sample["output"]["token_ids"]) == _MAX_TOKENS
+            for sample in raw["streaming_samples"]
         )
         config = WatermarkConfig(algorithm=mode, key=_KEY)
         wrong_config = WatermarkConfig(algorithm=mode, key=_KEY + 1)
@@ -297,7 +320,7 @@ def test_watermark_tp4_mixed_opt_out_and_streaming(tmp_path: Path) -> None:
         for name, rows in (
             ("marked", raw["marked"]),
             ("mixed_marked", [raw["mixed"][index] for index in (0, 2)]),
-            ("streaming", [raw["streaming"]["output"]]),
+            ("streaming", [sample["output"] for sample in raw["streaming_samples"]]),
         ):
             scores[name] = _detections(config, rows)
             scores[f"{name}_wrong_key"] = _detections(wrong_config, rows)
@@ -307,6 +330,18 @@ def test_watermark_tp4_mixed_opt_out_and_streaming(tmp_path: Path) -> None:
             checks[f"{name}_wrong_key_control"] = sum(
                 item["is_watermarked"] for item in scores[f"{name}_wrong_key"]
             ) <= (1 if len(rows) > 1 else 0)
+        scores["streaming_diagnostic"] = {
+            "p_value_threshold": _P_VALUE_THRESHOLD,
+            "first_sample_matching_key_detected": (
+                scores["streaming"][0]["num_scored"] > 0
+                and scores["streaming"][0]["p_value"] < _P_VALUE_THRESHOLD
+            ),
+            "first_sample_wrong_key_detected": (
+                scores["streaming_wrong_key"][0]["num_scored"] > 0
+                and scores["streaming_wrong_key"][0]["p_value"] < _P_VALUE_THRESHOLD
+            ),
+            "used_for_acceptance": False,
+        }
         for name, rows in (
             ("plain", raw["plain"]),
             ("mixed_optout", [raw["mixed"][index] for index in (1, 3)]),
