@@ -17,6 +17,7 @@ l0_gb200_multi_gpus:
       stage: pre_merge
       backend: pytorch
   tests:
+  - unittest/_torch/sampler/test_watermark_tp4.py::test_watermark_tp4_mixed_opt_out_and_streaming TIMEOUT (70)
   - unittest/_torch/moe/multi_gpu/test_moe_a2a_workspace.py TIMEOUT (10)
   - unittest/kv_cache_manager_v2_tests/test_host_numa_placement.py ISOLATION
   - unittest/_torch/modules/test_engram.py
