@@ -23,9 +23,14 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
-from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
-                                 is_sm_100f, prefer_pinned,
-                                 str_dtype_to_binding, torch_dtype_to_str)
+from tensorrt_llm._utils import (
+    confidential_compute_enabled,
+    get_sm_version,
+    is_sm_100f,
+    prefer_pinned,
+    str_dtype_to_binding,
+    torch_dtype_to_str,
+)
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 # isort: off
@@ -36,9 +41,10 @@ from tensorrt_llm.llmapi.llm_args import (
     SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs, WaitingQueuePolicy)
 # isort: on
 from tensorrt_llm._torch.peft.lora.config import (
-    LoraConfig, get_default_trtllm_modules_to_hf_modules)
-from tensorrt_llm._torch.peft.lora.manager import (load_torch_lora,
-                                                   supports_native_fp8_lora)
+    LoraConfig,
+    get_default_trtllm_modules_to_hf_modules,
+)
+from tensorrt_llm._torch.peft.lora.manager import load_torch_lora, supports_native_fp8_lora
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.quantization import QuantAlgo
@@ -48,24 +54,38 @@ from ..attention.backends import get_sparse_attn_kv_cache_manager
 from ..disaggregation.draft_kv import (model_ships_disagg_draft_window,
                                        select_disagg_draft_kv_cache_manager)
 from ..disaggregation.kv_cache_transceiver import (
-    AttentionTypeCpp, create_kv_cache_transceiver,
-    maybe_enable_fabric_memory_for_python_transceiver)
+    AttentionTypeCpp,
+    create_kv_cache_transceiver,
+    maybe_enable_fabric_memory_for_python_transceiver,
+)
 from ..hostfunc import set_low_latency_dispatch
 from ..model_config import ModelConfig
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
+from ..models.modeling_speculative import SpecDecOneEngineForCausalLM
 from ..speculative import (draft_prompt_lookahead, get_draft_block_width,
                            get_num_extra_kv_tokens, get_num_spec_layers,
                            get_spec_decoder, should_use_separate_draft_kv_cache)
+
+
 from ..speculative.spec_sampler_base import SpecSampler
 from ..utils import is_gdn_replay_enabled
 from . import config_utils
-from .config_utils import (MambaKVCacheParams, _is_sliding_attention_layer,
-                           extract_mamba_kv_cache_params,
-                           extract_qwen4_exp_ple_cache_params,
-                           get_layer_attention_window, is_gemma4_hybrid,
-                           is_hybrid_linear, is_kimi_linear, is_mla,
-                           is_nemotron_hybrid, is_qwen3_hybrid, is_qwen4_exp,
-                           resolve_vocab_size, uses_vswa_kv_cache_layout)
+from .config_utils import (
+    MambaKVCacheParams,
+    _is_sliding_attention_layer,
+    extract_mamba_kv_cache_params,
+    extract_qwen4_exp_ple_cache_params,
+    get_layer_attention_window,
+    is_gemma4_hybrid,
+    is_hybrid_linear,
+    is_kimi_linear,
+    is_mla,
+    is_nemotron_hybrid,
+    is_qwen3_hybrid,
+    is_qwen4_exp,
+    resolve_vocab_size,
+    uses_vswa_kv_cache_layout,
+)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
@@ -77,18 +97,28 @@ from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
                                            MambaHybridCacheManagerV2,
                                            MixedMambaHybridCacheManager,
                                            use_py_mamba_cache_manager)
+
 from .llm_request import ExecutorResponse, LlmRequestState
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
-from .resource_manager import (KVCacheCompressionManager, KVCacheManager,
-                               PeftCacheManager, ResourceManager,
-                               ResourceManagerType)
+from .resource_manager import (
+    KVCacheCompressionManager,
+    KVCacheManager,
+    PeftCacheManager,
+    ResourceManager,
+    ResourceManagerType,
+)
 from .runtime_hooks import runtime_hooks_of
 from .sampler import EarlyStopSampler, EarlyStopWithMMResult, TorchSampler
-from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
-                        KVCacheV2Scheduler, MultimodalEagerEncoderScheduler,
-                        MultimodalScheduler, SimpleScheduler,
-                        SimpleUnifiedScheduler)
+from .scheduler import (
+    BindCapacityScheduler,
+    BindMicroBatchScheduler,
+    KVCacheV2Scheduler,
+    MultimodalEagerEncoderScheduler,
+    MultimodalScheduler,
+    SimpleScheduler,
+    SimpleUnifiedScheduler,
+)
 from .seq_slot_manager import SeqSlotManager
 
 GB = 1 << 30
@@ -219,8 +249,7 @@ def get_kv_cache_manager_cls(
             raise NotImplementedError(
                 "FP4 MLA requires Fp4MlaKVCacheManagerV2, which does not "
                 "support hybrid linear-attention models.")
-        from ..attention.backends.fp4_mla.cache_manager import \
-            Fp4MlaKVCacheManagerV2
+        from ..attention.backends.fp4_mla.cache_manager import Fp4MlaKVCacheManagerV2
 
         return Fp4MlaKVCacheManagerV2
     use_v2 = kv_cache_config.use_kv_cache_manager_v2 is True
@@ -279,8 +308,7 @@ def get_kv_cache_manager_cls(
                     "indexer state is a V2 extra buffer). Leave "
                     "kv_cache_config.use_kv_cache_manager_v2='auto' or set it "
                     "to True.")
-            from ..attention.backends.sparse.glm_kpool import \
-                Glm5NextCacheManager
+            from ..attention.backends.sparse.glm_kpool import Glm5NextCacheManager
             return Glm5NextCacheManager
 
         # Kimi K3 (KDA + MLA hybrid): block reuse uses the unified C++ pool
@@ -2434,6 +2462,7 @@ class KvCacheCreator:
             FlashInferTrtllmGenFmha
         from ..speculative.dflash_attention import \
             dflash_trtllm_supports_page_size
+
         supported = FlashInferTrtllmGenFmha.SUPPORTED_TOKENS_PER_BLOCK
         runs_context_kernel = getattr(draft_model, "runs_trtllm_context_kernel",
                                       None)
@@ -2640,8 +2669,10 @@ class KvCacheCreator:
         token itself, and under block reuse the pool is funded for that many
         full-length mirrors instead.
         """
-        from .kv_cache.kv_cache_manager_v2 import (_get_generation_kv_capacity,
-                                                   max_admissible_sequences)
+        from .kv_cache.kv_cache_manager_v2 import (
+            _get_generation_kv_capacity,
+            max_admissible_sequences,
+        )
         if per_token_cost.slope <= 0 or per_token_cost.intercept != 0:
             # A windowed cost (slope 0, fixed part) would fund the pool with
             # zero bytes and the executor would fail to create the KV cache.
@@ -2980,6 +3011,62 @@ class KvCacheCreator:
             f"Cannot split KV cache max_gpu_total_bytes between target and "
             f"draft; bounding the draft to max_tokens={max_tokens}.")
         return bounded
+
+    # Warn only when admissible concurrency exceeds the graph-covered range
+    # by this factor, so a small overshoot off-graph does not trip it.
+    _CUDA_GRAPH_CAPTURE_WARN_FACTOR = 1.5
+
+    def _warn_if_admitted_concurrency_outruns_graph_capture(self) -> None:
+        """Warn when admitted decode concurrency far outruns CUDA-graph coverage.
+
+        Decode above the covered range runs eager, which can cost more
+        throughput than the extra concurrency buys; still valid at low load,
+        hence a warning that names the knobs rather than a refusal.
+        """
+        capture_sizes = getattr(self._model_engine, "_cuda_graph_batch_sizes",
+                                None)
+        padding = getattr(self._model_engine, "_cuda_graph_padding_enabled",
+                          None)
+        if (not isinstance(capture_sizes, (list, tuple)) or not capture_sizes
+                or not all(isinstance(s, int) for s in capture_sizes)):
+            # CUDA graphs disabled, or the engine does not expose its capture
+            # set.
+            return
+        if padding is True:
+            # Padding rounds a decode batch up to the nearest captured size,
+            # so everything up to the largest capture replays a graph.
+            covered = max(capture_sizes)
+        else:
+            # Without padding a decode batch replays a graph only at an exactly
+            # captured size, so the reliably covered range is the dense {1..n}
+            # prefix of the capture set; above it ragged batches rarely match.
+            covered = 0
+            for size in sorted(set(capture_sizes)):
+                if size != covered + 1:
+                    break
+                covered = size
+        if covered <= 0:
+            return
+        if not (isinstance(self._max_batch_size, int)
+                and self._max_batch_size > 0):
+            return
+        admissible = self._max_batch_size
+        if admissible <= self._CUDA_GRAPH_CAPTURE_WARN_FACTOR * covered:
+            return
+        logger.warning(
+            f"The engine admits up to ~{admissible} concurrent decode "
+            f"requests (scheduler max_batch_size={self._max_batch_size}), but "
+            f"captured CUDA graphs only cover decode "
+            f"batches up to {covered} (largest capture "
+            f"{max(capture_sizes)}, enable_padding="
+            f"{bool(padding)}). Decode batches above {covered} run in eager "
+            f"mode with a large per-iteration latency penalty, which can "
+            f"cost more throughput than the added concurrency buys. Raise "
+            f"cuda_graph_config.max_batch_size (or add larger "
+            f"cuda_graph_config.batch_sizes) and set "
+            f"cuda_graph_config.enable_padding=True so ragged batches round "
+            f"up to a captured size, or lower max_batch_size if decode above "
+            f"{covered} concurrent requests is not intended.")
 
     def _split_kv_cache_budget_for_draft(
         self,
@@ -3431,6 +3518,12 @@ class KvCacheCreator:
                     self._split_kv_cache_budget_for_draft(
                         budget_attr, self_kv_cache_config,
                         draft_kv_cache_config))
+
+        # Estimation managers are throwaway probes; the real build that
+        # follows runs the check against the same engine and scheduler
+        # settings.
+        if not estimating_kv_cache:
+            self._warn_if_admitted_concurrency_outruns_graph_capture()
 
         compression_config = self._llm_args.kv_cache_compression_config
         compression_manager = create_kv_cache_compression_manager(
@@ -3910,15 +4003,13 @@ def _create_kv_cache_manager(
                                     MambaHybridCacheManagerV2)
         if (spec_config is not None
                 and issubclass(kv_cache_manager_cls, kda_replay_manager_types)):
-            from ..modules.kimi_kda._kda_kernels import \
-                is_kda_mtp_verify_available
+            from ..modules.kimi_kda._kda_kernels import is_kda_mtp_verify_available
             if is_kda_mtp_verify_available():
                 kda_extra_kwargs["kda_replay_num_spec"] = (
                     spec_config.tokens_per_gen_step - 1)
         if is_glm5_next:
             # The manager places an indexer buffer on every attention layer.
-            from ..attention.backends.sparse.glm_kpool import \
-                glm_kpool_cache_row_dim
+            from ..attention.backends.sparse.glm_kpool import glm_kpool_cache_row_dim
             kda_extra_kwargs["index_state_dim"] = glm_kpool_cache_row_dim(
                 int(text_config.index_head_dim))
         # KDA's conv state is a [Q | K | V] concatenation whose three sections
@@ -4367,8 +4458,9 @@ def create_kv_cache_compression_manager(
 
         validate_kv_cache_compression_compatibility(config, kv_cache_config,
                                                     model_engine.spec_config)
-        from ..kv_cache_compression.quantization_for_cold_page.nvfp4_quantization import \
-            Nvfp4ColdPageQuantizationCompression
+        from ..kv_cache_compression.quantization_for_cold_page.nvfp4_quantization import (
+            Nvfp4ColdPageQuantizationCompression,
+        )
 
         return Nvfp4ColdPageQuantizationCompression(
             config,
@@ -4379,8 +4471,7 @@ def create_kv_cache_compression_manager(
         validate_kv_cache_compression_compatibility(config, kv_cache_config,
                                                     model_engine.spec_config)
         # TriAttention imports CuTe/CUTLASS; keep normal executor startup lazy.
-        from ..kv_cache_compression.triattention.triattention import \
-            TriAttentionCompressionManager
+        from ..kv_cache_compression.triattention.triattention import TriAttentionCompressionManager
 
         return TriAttentionCompressionManager(
             config,
@@ -4998,6 +5089,7 @@ def create_torch_sampler_args(
     enable_async_worker: bool,
     enable_speculative_beam_history_d2h: bool,
     max_num_sequences: int,
+    watermark_config=None,
 ):
     # The sampler's per-slot state is indexed by sequence slots, so it must
     # be sized identically to the executor's slot pool.
@@ -5015,6 +5107,7 @@ def create_torch_sampler_args(
         disable_overlap_scheduler=disable_overlap_scheduler,
         enable_async_worker=enable_async_worker,
         enable_speculative_beam_history_d2h=enable_speculative_beam_history_d2h,
+        watermark_config=watermark_config,
     )
 
 
@@ -5048,12 +5141,20 @@ def instantiate_sampler(
         enable_speculative_beam_history_d2h=llm_args.
         enable_speculative_beam_history_d2h,
         max_num_sequences=max_num_sequences,
+        watermark_config=getattr(llm_args, "watermark_config", None),
     )
     if engine.spec_config is not None and engine.spec_config.spec_dec_mode.has_spec_decoder(
     ):
         sampler = get_spec_decoder(sampler_args, engine.spec_config)
         runtime_hooks = runtime_hooks_of(engine.model)
         if isinstance(sampler, SpecSampler):
+            if (engine.spec_config.spec_dec_mode.is_dspark()
+                    and mapping.pp_size == 1 and mapping.cp_size == 1
+                    and not mapping.enable_attention_dp
+                    and llm_args.modeling_v2 == "off"
+                    and isinstance(engine.model, SpecDecOneEngineForCausalLM)
+                    and engine.model.supports_speculative_output_scores()):
+                sampler.logit_projection = engine.model.project_speculative_logits
             if runtime_hooks.spec_step_fold is not None:
                 sampler.bind_spec_step_fold(runtime_hooks.spec_step_fold)
             sampler.d2h_side_stream_copies = runtime_hooks.sampler_d2h_side_stream
@@ -5153,8 +5254,7 @@ def _infer_shared_expert_size_from_adapter(adapter_dir: str) -> int:
     import json
 
     try:
-        from tensorrt_llm.models.convert_utils import (get_model_path,
-                                                       load_state_dict)
+        from tensorrt_llm.models.convert_utils import get_model_path, load_state_dict
         model_path = get_model_path(adapter_dir, "adapter_model")
         if model_path is None:
             return 0

@@ -105,6 +105,14 @@ l0_cpu:
   - unittest/_torch/models/test_minimax_m3_vl.py::test_fast_path_expand_video_one_bracket_per_temporal_patch
   - unittest/_torch/models/test_minimax_m3_vl.py::test_token_id_request_takes_the_fast_path_without_detokenizing
   - unittest/_torch/models/test_minimax_m3_vl.py::test_video_request_lets_the_processor_resize_frames
+  - unittest/_torch/models/test_minimax_m3_vl.py::test_fast_path_expand_timed_video_writes_timestamps
+  - unittest/_torch/models/test_minimax_m3_vl.py::test_video_timing_is_forwarded_to_the_processor
+  - unittest/_torch/models/test_minimax_m3_vl.py::test_video_timing_accepts_index_tensors
+  - unittest/_torch/models/test_minimax_m3_vl.py::test_video_without_timing_passes_no_metadata
+  - unittest/_torch/models/test_minimax_m3_vl.py::test_float_tensor_media_turn_off_the_processor_rescale
+  - unittest/_torch/models/test_minimax_m3_vl.py::test_float_media_outside_the_pt_contract_is_rejected
+  - unittest/_torch/models/test_minimax_m3_vl.py::test_mixed_format_media_fall_back_to_uint8
+  - unittest/_torch/models/test_minimax_mixed_media_fastpath.py
   # MiniMax-M3 VL forward under speculative decoding, KV reuse and chunked prefill.
   - unittest/_torch/models/test_minimax_m3_vl_spec_reuse.py::test_speculative_multimodal_prefill_forwards_orig_input_ids
   - unittest/_torch/models/test_minimax_m3_vl_spec_reuse.py::test_full_image_prefix_reuse_hit_skips_fusion
@@ -175,6 +183,8 @@ l0_cpu:
   - unittest/executor/test_proxy_aget_stats_async.py
   - unittest/executor/test_multi_frontend_routing.py
   - unittest/executor/test_event_loop_error_broadcast.py
+  - unittest/executor/test_forward_error_survival.py
+  - unittest/executor/test_m31_prewarm_admission.py
   - unittest/executor/test_rpc_worker_mixin.py
   - unittest/executor/test_sleep_collective_rpc_guards.py
   - unittest/executor/test_stats_serializer.py
@@ -224,6 +234,8 @@ l0_cpu:
   - unittest/llmapi/test_whisper_suppress_tokens_processor.py
   - unittest/llmapi/test_kv_cache_dtype_override.py
   - unittest/llmapi/test_llm_args.py
+  - unittest/llmapi/test_watermark_m31_config.py
+  - unittest/_torch/sampler/test_watermark_runtime.py
   - unittest/llmapi/test_mx_args.py
   - unittest/llmapi/test_custom_tokenizer_aliases.py
   - unittest/llmapi/test_llm_quant.py

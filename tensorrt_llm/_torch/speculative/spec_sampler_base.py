@@ -22,14 +22,20 @@ output into slot-indexed buffers, starts the async D2H copy, and updates
 requests host-side. Buffer shapes derive entirely from ``TorchSampler.Args``.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Optional
 
 import torch
 
 from ..._utils import prefer_pinned
-from ...sampling_params import SamplingParams
-from ..pyexecutor.llm_request import LlmRequest, LlmRequestState, get_draft_token_length
+from ...sampling_params import LogprobMode, SamplingParams
+from ..pyexecutor.llm_request import (
+    ContextLogitsOrigin,
+    LlmRequest,
+    LlmRequestState,
+    get_draft_token_length,
+)
 from ..pyexecutor.resource_manager import BaseResourceManager
 from ..pyexecutor.runtime_hooks import SpecStepFold, hook_work
 from ..pyexecutor.sampler import (
@@ -45,7 +51,16 @@ from ..pyexecutor.sampler import (
 from ..pyexecutor.sampler.penalties import has_occurrence_penalty
 from ..pyexecutor.sampler.sampler_common import _request_get_sampling_params, top_p_decay_active
 from ..pyexecutor.sampler.sampler_features import handle_stop_criteria
+from ..pyexecutor.sampler.watermark import WatermarkSpecState, request_carries_watermark
 from ..pyexecutor.scheduler import ScheduledRequests
+from .logprobs import (
+    GATHER_IDS_KEY,
+    HIDDEN_STATES_KEY,
+    RawLogProbs,
+    raw_logprobs,
+    target_row_indices,
+    token_logprobs,
+)
 
 # Rejection messages for the sampling features the one-model speculative path
 # cannot honor. They are module constants because two places raise them: the
@@ -84,10 +99,17 @@ UNSUPPORTED_MIN_P_MSG = (
     "config when using one-model speculative decoding. Restore that default, "
     "drop min_p from the request, or disable speculative decoding."
 )
+UNSUPPORTED_PROCESSED_LOGPROBS_MSG = (
+    "Processed log probabilities are not supported with one-model speculative decoding. "
+    "Use logprobs_mode='raw', or disable speculative decoding."
+)
 
 
 def one_model_sampling_rejection_reason(
-    sampling_params: Optional[SamplingParams], *, fused_sampling: bool = False
+    sampling_params: Optional[SamplingParams],
+    *,
+    fused_sampling: bool = False,
+    supports_min_tokens: bool = False,
 ) -> Optional[str]:
     """Why ``sampling_params`` cannot be served by the one-model speculative path.
 
@@ -104,12 +126,14 @@ def one_model_sampling_rejection_reason(
     """
     if sampling_params is None:
         return None
+    if sampling_params.logprobs is not None and sampling_params.logprobs_mode != LogprobMode.RAW:
+        return UNSUPPORTED_PROCESSED_LOGPROBS_MSG
     # min_tokens is what SamplingParams calls the field LlmRequest carries as
     # py_min_length. The OpenAI frontend always forwards it, so gate on the
     # value rather than on its presence -- same reasoning as the LlmRequest
     # check below.
     min_tokens = sampling_params.min_tokens
-    if min_tokens and min_tokens > 0:
+    if min_tokens and min_tokens > 0 and not supports_min_tokens:
         return UNSUPPORTED_MIN_LENGTH_MSG
     # Either form populates py_bad_words; the string form needs a tokenizer to
     # resolve, so test the raw fields rather than _get_bad_words().
@@ -159,6 +183,9 @@ class SampleStateSpec(SampleState):
     # instead would see the NEXT step's buffer, which update_requests itself
     # installs.
     draft_lens: Optional[list[int]] = None
+    raw_logprobs: RawLogProbs | None = None
+    logprob_request_indices: list[int] | None = None
+    watermark_state: WatermarkSpecState | None = None
 
 
 class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
@@ -185,6 +212,12 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
     static_slot_ids: bool = False
     _slot_ids_host: Optional[list[int]] = None
     _slot_ids_cuda: Optional[torch.Tensor] = None
+    # Bound only for models that export original target states for this path.
+    logit_projection: Callable[[torch.Tensor], torch.Tensor] | None = None
+
+    @property
+    def handles_logits(self) -> bool:
+        return self.logit_projection is not None
 
     SampleState = SampleStateSpec
 
@@ -194,15 +227,17 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
     def validate_request(self, request: LlmRequest) -> None:
         """Reject sampling parameters the one-model speculative path cannot honor.
 
-        The fused backend supports min_p; other one-model sampling backends do
-        not. This sampler also does not return context logits, generation logits,
-        or log probabilities. Raised during request admission, so only the
-        offending request fails rather than the whole executor step.
+        DSpark models with a bound target projection can return original context
+        logits and raw target log probabilities. Processed scores and generation
+        logits still require their own output lifecycle.
         """
         requested_outputs = (
-            ("return_context_logits / prompt_logprobs", request.py_return_context_logits),
+            (
+                "return_context_logits / prompt_logprobs",
+                request.py_return_context_logits and not self.handles_logits,
+            ),
             ("return_generation_logits", request.py_return_generation_logits),
-            ("logprobs", request.py_return_log_probs),
+            ("logprobs", request.py_return_log_probs and not self.handles_logits),
         )
         unsupported_outputs = [name for name, requested in requested_outputs if requested]
         if unsupported_outputs:
@@ -211,14 +246,21 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                 f"{', '.join(unsupported_outputs)}. Drop these options from "
                 "the request, or disable speculative decoding."
             )
+        if request.py_return_log_probs and request.py_logprobs_mode != LogprobMode.RAW:
+            raise ValueError(UNSUPPORTED_PROCESSED_LOGPROBS_MSG)
 
+        reason = getattr(self, "_watermark_unsupported_reason", None)
+        if reason is not None and request_carries_watermark(self._watermark_config, request):
+            raise ValueError(reason)
         sampling_config = request.sampling_config
         if sampling_config is None:
             return
         min_p = sampling_config.min_p
         if min_p and min_p > 0.0 and not self._fused_sampling:
             raise ValueError(UNSUPPORTED_MIN_P_MSG)
-        self._validate_unsupported_logits_processors(request)
+        self._validate_unsupported_logits_processors(
+            request, supports_min_tokens=self._supports_min_tokens
+        )
         # The occurrence penalties need a [slots, vocab_size] workspace that is only
         # allocated when the deploy opted in, so a request asking for them while the
         # flag is off cannot be honored. Reject instead of silently decoding from an
@@ -245,7 +287,9 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             )
 
     @staticmethod
-    def _validate_unsupported_logits_processors(request: LlmRequest) -> None:
+    def _validate_unsupported_logits_processors(
+        request: LlmRequest, *, supports_min_tokens: bool = False
+    ) -> None:
         """Reject logits-side sampling features the one-model path cannot apply.
 
         TorchSampler implements min_length, bad_words, no_repeat_ngram_size,
@@ -261,7 +305,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         # it is routinely present and holds the neutral value -- gate on the
         # value, not on its presence.
         min_length = getattr(request, "py_min_length", None)
-        if min_length and min_length > 0:
+        if min_length and min_length > 0 and not supports_min_tokens:
             raise ValueError(UNSUPPORTED_MIN_LENGTH_MSG)
         if getattr(request, "py_bad_words", None):
             raise ValueError(UNSUPPORTED_BAD_WORDS_MSG)
@@ -294,6 +338,8 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         enable_penalty: bool = False,
         penalty_supported: bool = True,
         fused_sampling: bool = False,
+        supports_min_tokens: bool = False,
+        watermark_unsupported_reason: Optional[str] = None,
     ):
         """
         Initialize the speculative sampler.
@@ -307,9 +353,12 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                 the penalties can map (linear modes yes, tree modes not yet).
             fused_sampling: whether the configured sampler supports min_p.
         """
+        self._watermark_config = args.watermark_config
+        self._watermark_unsupported_reason = watermark_unsupported_reason
         self._enable_penalty = enable_penalty
         self._penalty_supported = penalty_supported
         self._fused_sampling = fused_sampling
+        self._supports_min_tokens = supports_min_tokens
         self._async_worker_init(args.enable_async_worker)
         self.mapping = None
         self.max_seq_len = args.max_seq_len
@@ -337,6 +386,13 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             ),
             next_draft_tokens=int_tensor((seq_slots, args.max_total_draft_tokens)),
             new_tokens_lens=int_tensor((seq_slots,)),
+        )
+
+        from ..pyexecutor.sampler.watermark_runtime import emit_watermark_runtime_identity
+
+        emit_watermark_runtime_identity(
+            "spec_sampler_constructed", self, watermark_config=args.watermark_config,
+            sampler_args=args,
         )
 
     def _device_slot_ids(self, seq_slots: list[int]) -> torch.Tensor:
@@ -464,6 +520,8 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
 
         for req_idx, req in enumerate(state.requests):
             if req.state == LlmRequestState.GENERATION_COMPLETE:
+                if state.watermark_state is not None:
+                    state.watermark_state.handler.invalidate([req])
                 continue
             num_new_tokens = new_tokens_lens_list[req.py_seq_slot]
             # new_tokens is sized to this bound, and add_token indexes a plain
@@ -473,12 +531,34 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                 f"accepted {num_new_tokens} tokens in one step, but new_tokens is "
                 f"sized for {self.max_accepted_path_len}"
             )
+            committed = []
             for i in range(num_new_tokens):
                 new_token = add_token(req, new_tokens, beam_idx=beam_idx, step=i)
+                committed.append(new_token)
                 if handle_stop_criteria(
                     req, new_token, max_seq_len=self.max_seq_len, beam_idx=beam_idx
                 ):
                     break
+            if (state.watermark_state is not None
+                    and (len(committed) != num_new_tokens
+                         or req.state == LlmRequestState.GENERATION_COMPLETE)):
+                # A later context/recompute entry must restore the delivered
+                # prefix, not an unused overlapped or post-stop GPU suffix.
+                state.watermark_state.handler.invalidate([req])
+            if state.raw_logprobs is not None and state.logprob_request_indices is not None:
+                if req_idx in state.logprob_request_indices:
+                    score_row = state.logprob_request_indices.index(req_idx)
+                    req.py_result.append_log_probs(
+                        [
+                            token_logprobs(
+                                state.raw_logprobs,
+                                score_row,
+                                committed,
+                                top_k=req.py_num_logprobs,
+                                simple_format=req.py_logprobs_simple_format,
+                            )
+                        ]
+                    )
             req.py_num_accepted_draft_tokens = num_new_tokens - 1
             # Pair the acceptance count with the draft count of the SAME step,
             # snapshotted at sample_async time: _request_common_handling below
@@ -575,6 +655,11 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         finished_context_requests = scheduled_requests.context_requests_last_chunk
         sampling_requests = finished_context_requests + scheduled_requests.generation_requests
         num_sampling_requests = len(sampling_requests)
+        watermark_state = outputs.get("watermark_state")
+        if watermark_state is not None and (
+                not isinstance(watermark_state, WatermarkSpecState)
+                or not watermark_state.ready):
+            raise ValueError("speculative outputs must bind the prepared watermark state")
 
         # Snapshot each request's draft count for THIS step before
         # _add_dummy_draft_tokens below installs placeholder drafts on
@@ -637,6 +722,13 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                 raise ValueError("verify_lens must contain one int32 token window per output row")
             o_verify_lens = o_verify_lens[num_skip : num_skip + num_sampling_requests]
 
+        scores, score_requests = (
+            self._stage_requested_logits(
+                scheduled_requests, outputs, sampling_requests, runtime_draft_len
+            )
+            if self.handles_logits
+            else (None, [])
+        )
         step_fold = self.spec_step_fold
         stored_here = step_fold is None or not step_fold.sampler_rows_stored(
             outputs, num_skip, seq_slots
@@ -679,4 +771,76 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             sampler_event=sampler_event,
             runtime_draft_len=runtime_draft_len,
             draft_lens=draft_lens,
+            raw_logprobs=scores,
+            logprob_request_indices=score_requests,
+            watermark_state=watermark_state,
         )
+
+    def _stage_requested_logits(
+        self,
+        scheduled: ScheduledRequests,
+        outputs: dict[str, torch.Tensor | bool],
+        requests: list[LlmRequest],
+        runtime_draft_len: int,
+    ) -> tuple[RawLogProbs | None, list[int]]:
+        """Materialize requested scores after graph replay, before the next forward.
+
+        The original target states bypass guided masks, penalties, draft-head
+        scores, and vocabulary-sharded verification fast paths. Only requests
+        asking for output scores run this projection; normal traffic retains
+        its existing sampling and graph paths.
+        """
+        requested = [i for i, request in enumerate(requests) if request.py_return_log_probs]
+        context_requested = any(r.py_return_context_logits for r in scheduled.context_requests)
+        if not requested and not context_requested:
+            return None, []
+        if self.logit_projection is None:
+            raise ValueError("the speculative model does not provide original target logits")
+        hidden_states = outputs[HIDDEN_STATES_KEY]
+        gather_ids = outputs[GATHER_IDS_KEY]
+        context_offset = 0
+        for request in scheduled.context_requests:
+            end = context_offset + request.context_chunk_size
+            if request.py_return_context_logits:
+                start = request.context_current_position
+                original_end = min(start + request.context_chunk_size, request.orig_prompt_len)
+                # A resumed request can prefill generated history as context;
+                # keep those rows outside the original prompt output.
+                if start < original_end:
+                    request.py_result.append_context_logits(
+                        self.logit_projection(
+                            hidden_states[context_offset : context_offset + original_end - start]
+                        ),
+                        ContextLogitsOrigin(
+                            client_id=request.py_client_id,
+                            prompt_length=request.orig_prompt_len,
+                            start=start,
+                            end=original_end,
+                        ),
+                    )
+            context_offset = end
+        if not requested:
+            return None, []
+        num_skip = len(scheduled.context_requests_chunking)
+        output_rows = torch.tensor(
+            [num_skip + index for index in requested], dtype=torch.long, device=hidden_states.device
+        )
+        rows, valid = target_row_indices(
+            output_rows,
+            num_contexts=len(scheduled.context_requests),
+            num_generations=outputs["new_tokens_lens"].shape[0] - len(scheduled.context_requests),
+            width=runtime_draft_len + 1,
+            verify_lens=outputs.get("verify_lens"),
+        )
+        logits = self.logit_projection(hidden_states[gather_ids[rows.flatten()].long()])
+        logits = logits.reshape(*rows.shape, -1)
+        tokens = outputs["new_tokens"][output_rows, : runtime_draft_len + 1]
+        # Padded output columns are not committed and may contain sentinels.
+        positions = torch.arange(rows.shape[1], device=rows.device)
+        valid = valid & (
+            positions.unsqueeze(0) < outputs["new_tokens_lens"][output_rows].unsqueeze(1)
+        )
+        tokens = torch.where(valid, tokens, torch.zeros_like(tokens))
+        max_top_k = max(requests[index].py_num_logprobs for index in requested)
+        scores = raw_logprobs(logits, tokens, max_top_k)
+        return scores.to_host(self._copy_to_host), requested

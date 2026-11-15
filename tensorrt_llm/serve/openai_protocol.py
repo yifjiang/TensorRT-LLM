@@ -25,42 +25,59 @@ import torch
 import xgrammar
 from fastapi import UploadFile
 from openai.types.chat import ChatCompletionAssistantMessageParam
-from openai.types.chat import \
-    ChatCompletionContentPartParam as OpenAIChatCompletionContentPartParam
-from openai.types.chat import \
-    ChatCompletionMessageParam as OpenAIChatCompletionMessageParam
+from openai.types.chat import ChatCompletionContentPartParam as OpenAIChatCompletionContentPartParam
+from openai.types.chat import ChatCompletionMessageParam as OpenAIChatCompletionMessageParam
 from openai.types.responses import (
     ResponseCodeInterpreterCallCodeDeltaEvent,
     ResponseCodeInterpreterCallCodeDoneEvent,
     ResponseCodeInterpreterCallCompletedEvent,
     ResponseCodeInterpreterCallInProgressEvent,
-    ResponseCodeInterpreterCallInterpretingEvent, ResponseCompletedEvent,
-    ResponseContentPartAddedEvent, ResponseContentPartDoneEvent,
-    ResponseCreatedEvent, ResponseFormatTextConfig, ResponseFunctionToolCall,
-    ResponseInProgressEvent, ResponseInputItemParam, ResponseOutputItem,
-    ResponseOutputItemAddedEvent, ResponseOutputItemDoneEvent, ResponsePrompt,
-    ResponseReasoningItem, ResponseReasoningTextDeltaEvent,
-    ResponseReasoningTextDoneEvent, ResponseStatus, ResponseTextConfig,
-    ResponseWebSearchCallCompletedEvent, ResponseWebSearchCallInProgressEvent,
-    ResponseWebSearchCallSearchingEvent)
+    ResponseCodeInterpreterCallInterpretingEvent,
+    ResponseCompletedEvent,
+    ResponseContentPartAddedEvent,
+    ResponseContentPartDoneEvent,
+    ResponseCreatedEvent,
+    ResponseFormatTextConfig,
+    ResponseFunctionToolCall,
+    ResponseInProgressEvent,
+    ResponseInputItemParam,
+    ResponseOutputItem,
+    ResponseOutputItemAddedEvent,
+    ResponseOutputItemDoneEvent,
+    ResponsePrompt,
+    ResponseReasoningItem,
+    ResponseReasoningTextDeltaEvent,
+    ResponseReasoningTextDoneEvent,
+    ResponseStatus,
+    ResponseTextConfig,
+    ResponseWebSearchCallCompletedEvent,
+    ResponseWebSearchCallInProgressEvent,
+    ResponseWebSearchCallSearchingEvent,
+)
 from openai.types.responses.response import ToolChoice
 from openai.types.responses.tool import Tool
 from openai.types.shared import Metadata, Reasoning
 from openai_harmony import ReasoningEffort
-from pydantic import (AliasChoices, BaseModel, ConfigDict, Field,
-                      NonNegativeInt, PositiveInt, field_validator,
-                      model_serializer, model_validator)
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    NonNegativeInt,
+    PositiveInt,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 from typing_extensions import Annotated, Required, TypeAlias, TypedDict
 
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.inputs.media_io import MediaModality
 from tensorrt_llm.llmapi import ConversationParams as LlmConversationParams
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
-from tensorrt_llm.llmapi import (DisaggScheduleStyle, GuidedDecodingParams,
-                                 SamplingParams)
+from tensorrt_llm.llmapi import DisaggScheduleStyle, GuidedDecodingParams, SamplingParams
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
-from tensorrt_llm.sampling_params import (check_logprobs_limit,
-                                          validate_thinking_token_budget)
+from tensorrt_llm.sampling_params import check_logprobs_limit, validate_thinking_token_budget
 from tensorrt_llm.scheduling_params import AgentHierarchy
 from tensorrt_llm.serve.serving_extensions import structured_output_format_for
 from tensorrt_llm.visual_gen.params import MediaRole
@@ -687,6 +704,13 @@ class CompletionRequest(OpenAIBaseModel):
     return_context_logits: bool = False
     detokenize: bool = True
     thinking_token_budget: Optional[int] = None
+    watermarking: Optional[bool] = Field(
+        default=None,
+        description=
+        ("Whether to watermark the generated text. Takes effect only when the "
+         "server is configured with `watermark_config`. None or true requests a "
+         "watermark; false opts out when the server allows it."),
+    )
     # doc: end-completion-sampling-params
 
     # doc: begin-completion-extra-params
@@ -774,6 +798,7 @@ class CompletionRequest(OpenAIBaseModel):
                 self.response_format),
             detokenize=self.detokenize,
             thinking_token_budget=self.thinking_token_budget,
+            watermarking=self.watermarking,
 
             # logits_bias
             embedding_bias=_logit_bias_to_embedding_bias(
@@ -1121,6 +1146,13 @@ class ChatCompletionRequest(OpenAIBaseModel):
     # template understands it (e.g. kimi_k3); other models ignore it.
     thinking: Optional[ChatCompletionThinkingParam] = None
     thinking_token_budget: Optional[int] = None
+    watermarking: Optional[bool] = Field(
+        default=None,
+        description=
+        ("Whether to watermark the generated text. Takes effect only when the "
+         "server is configured with `watermark_config`. None or true requests a "
+         "watermark; false opts out when the server allows it."),
+    )
     prompt_ignore_length: Optional[int] = 0
 
     # doc: begin-chat-completion-sampling-params
@@ -1304,6 +1336,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 reasoning_parser=reasoning_parser,
                 chat_template_kwargs=self.chat_template_kwargs),
             thinking_token_budget=self.thinking_token_budget,
+            watermarking=self.watermarking,
 
             # logits_bias
             embedding_bias=_logit_bias_to_embedding_bias(

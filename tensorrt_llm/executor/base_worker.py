@@ -32,8 +32,7 @@ from .._torch.peft.lora.manager import LoraManager
 from .._torch.peft.prompt_adapter import PromptAdapterManager
 from .._torch.pyexecutor.kv_cache_stats import append_kv_cache_iteration_stats
 from .._torch.pyexecutor.llm_request import LlmResponse
-from .._utils import (global_mpi_rank, global_mpi_size, mpi_comm, mpi_rank,
-                      nvtx_range_debug)
+from .._utils import global_mpi_rank, global_mpi_size, mpi_comm, mpi_rank, nvtx_range_debug
 from ..bindings import executor as tllm
 from ..llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType
 from ..llmapi.tokenizer import TokenizerBase
@@ -43,15 +42,24 @@ from ..runtime import ModelConfig
 from ..sampling_params import BatchedLogitsProcessor, SamplingParams
 from .executor import GenerationExecutor, IterationResultQueue
 from .ipc import FusedIpcQueue, IpcQueue
-from .postproc_worker import (PostprocParams, PostprocWorker,
-                              PostprocWorkerConfig)
+from .postproc_worker import PostprocParams, PostprocWorker, PostprocWorkerConfig
 from .request import GenerationRequest, LoRARequest, PromptAdapterRequest
-from .result import (GenerationResult, LogProbsResult, ResponseWrapper,
-                     compute_logprobs, get_metrics_dict)
-from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
-                    bucket_responses_by_frontend,
-                    context_length_exceeded_message, frontend_lane_index,
-                    is_llm_response)
+from .result import (
+    GenerationResult,
+    LogProbsResult,
+    ResponseWrapper,
+    compute_logprobs,
+    get_metrics_dict,
+)
+from .utils import (
+    ErrorResponse,
+    IntraProcessQueue,
+    RequestError,
+    bucket_responses_by_frontend,
+    context_length_exceeded_message,
+    frontend_lane_index,
+    is_llm_response,
+)
 
 if TYPE_CHECKING:
     from .._torch.disaggregation.kv_cache_transceiver import KvCacheTransceiver
@@ -159,10 +167,7 @@ class BaseWorker(GenerationExecutor):
         return comm_ranks, device_ids
 
     def setup_engine(self):
-        """
-        Setup the engine for the worker.
-        """
-
+        """Setup the engine for the worker."""
         if isinstance(self._engine, list):
             self._engine = self._engine[self.rank]
 
@@ -173,8 +178,7 @@ class BaseWorker(GenerationExecutor):
             ), "llm_args should be with backend in _create_py_executor"
             _ = self._get_comm_ranks_device_id()
             if self._backend == "pytorch":
-                from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
-                    create_py_executor
+                from tensorrt_llm._torch.pyexecutor.py_executor_creator import create_py_executor
                 create_executor = create_py_executor
                 args["llm_args"] = self.llm_args
                 args["checkpoint_dir"] = self._hf_model_dir
@@ -189,8 +193,7 @@ class BaseWorker(GenerationExecutor):
             self.mapping = self.llm_args.parallel_config.to_mapping()
             self.checkpoint_loader = None
             if self._backend == "pytorch":
-                from tensorrt_llm._torch.pyexecutor.model_loader import \
-                    _construct_checkpoint_loader
+                from tensorrt_llm._torch.pyexecutor.model_loader import _construct_checkpoint_loader
                 partial_model_loading = self.llm_args.is_partial_model_loading
                 self.checkpoint_loader = _construct_checkpoint_loader(
                     self.llm_args.checkpoint_loader,
@@ -217,8 +220,7 @@ class BaseWorker(GenerationExecutor):
         self._runtime_model_config: Optional[ModelConfig] = None
 
         if self._backend == "pytorch" and self._lora_config is not None:
-            from tensorrt_llm._torch.pyexecutor.resource_manager import \
-                ResourceManagerType
+            from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
             peft_cache_manager = self.engine.resource_manager.resource_managers.get(
                 ResourceManagerType.PEFT_CACHE_MANAGER)
             self._lora_manager = peft_cache_manager.get_lora_manager()
@@ -288,7 +290,7 @@ class BaseWorker(GenerationExecutor):
                             queues: list["IpcQueue"],
                             *,
                             coexist_with_result_queue: bool = False) -> None:
-        """ Set the IPC queues for feeding post-processing processes.
+        """Set the IPC queues for feeding post-processing processes.
 
         coexist_with_result_queue: the classic proxy gives each PostprocWorker
         its own push lane to the frontend, so a result_queue must not exist
@@ -547,6 +549,7 @@ class BaseWorker(GenerationExecutor):
                 request.sampling_params.logprobs_simple_format)
             executor_request.py_return_routed_experts = (
                 request.sampling_params.return_routed_experts)
+            executor_request.py_watermarking = request.sampling_params.watermarking
 
             # here we add executor_request.py_disaggregated_params= request.disaggregated_params for python cache transceiver
             if self._is_pytorch_backend and request.disaggregated_params is not None:
@@ -588,7 +591,7 @@ class BaseWorker(GenerationExecutor):
             raise RequestError(str(e)) from e
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
-        """ Low-level API to the executor. Return a "future" GenerationResult which can be waited. """
+        """Low-level API to the executor. Return a "future" GenerationResult which can be waited."""
         self.start()
 
         if self.rank != 0:
@@ -687,10 +690,12 @@ class BaseWorker(GenerationExecutor):
                 values; forwarded verbatim to each rank's VMM call.
         """
         from tensorrt_llm._torch.pyexecutor.py_executor import (
-            _SLEEP_WAKEUP_ACK_TIMEOUT_S, _recv_sleep_wakeup_ack_until,
-            _SleepWakeupAction, _SleepWakeupTag)
-        from tensorrt_llm._torch.virtual_memory import (materialize_with_tag,
-                                                        release_with_tag)
+            _SLEEP_WAKEUP_ACK_TIMEOUT_S,
+            _recv_sleep_wakeup_ack_until,
+            _SleepWakeupAction,
+            _SleepWakeupTag,
+        )
+        from tensorrt_llm._torch.virtual_memory import materialize_with_tag, release_with_tag
 
         if self.rank != 0:
             raise RuntimeError(
@@ -922,8 +927,7 @@ class BaseWorker(GenerationExecutor):
 
     def _fail_stop_divergent_sleep_wakeup(self, error: RuntimeError) -> None:
         """Stop every rank after a sleep/wakeup operation may have diverged."""
-        from tensorrt_llm._torch.pyexecutor.hang_detector import \
-            propagate_hard_kill
+        from tensorrt_llm._torch.pyexecutor.hang_detector import propagate_hard_kill
 
         self._set_fatal_error(error)
         if self.engine is not None:
@@ -1313,7 +1317,7 @@ class BaseWorker(GenerationExecutor):
 
 
 class AwaitResponseHelper:
-    ''' Multiple-implementations for await_response for performance. '''
+    """Multiple-implementations for await_response for performance."""
 
     class HandlerKind(enum.Enum):
         unknown = 0
@@ -1343,14 +1347,14 @@ class AwaitResponseHelper:
                               or self.worker.postproc_queues is not None
                               or self.worker.frontend_result_queues is not None)
             if not has_ipc_queues:
-                logger_debug(f"creating await_response helper for Worker\n",
+                logger_debug("creating await_response helper for Worker\n",
                              color="yellow")
                 # When ExecutorBindingWorker is used in the main process
                 # aka the single process mode
                 self.handler_kind = HandlerKind.single_process_worker
             else:
                 # The ExecutorBindingProxy is used
-                logger_debug(f"creating await_response helper for IPC\n",
+                logger_debug("creating await_response helper for IPC\n",
                              color="yellow")
                 self.handler_kind = HandlerKind.ipc_batched
         return self.handler_kind
@@ -1398,7 +1402,7 @@ class AwaitResponseHelper:
         return responses
 
     def __call__(self, timeout: Optional[float] = None) -> bool:
-        ''' This method should be called by a ManagedThread. '''
+        """This method should be called by a ManagedThread."""
         timeout = timeout or 0.1
         try:
             responses = self.worker.engine.await_responses(
@@ -1526,7 +1530,7 @@ class AwaitResponseHelper:
         return False
 
     def handle_for_worker(self, responses: List[tllm.Response]) -> None:
-        ''' Return the responses to asyncio.event_loop. '''
+        """Return the responses to asyncio.event_loop."""
         event_loop = None
         async_queues = []
         for response in responses:
@@ -1556,7 +1560,7 @@ class AwaitResponseHelper:
             _SyncQueue.notify_many(event_loop, async_queues)
 
     def handle_for_ipc_batched(self, responses: List[tllm.Response]) -> None:
-        ''' Perform the IPC in batch explicitly. '''
+        """Perform the IPC in batch explicitly."""
         postproc_batches = [
             []
             for _ in range(self.worker.postproc_config.num_postprocess_workers)
@@ -1617,7 +1621,7 @@ def _get_params_for_first_rsp(
 def _compute_pytorch_prompt_logprobs(
         generation_result: GenerationResult,
         response: LlmResponse) -> Optional[LogProbsResult]:
-    """Compute prompt logprobs for PyTorch backend (cached when streaming) """
+    """Compute prompt logprobs for PyTorch backend (cached when streaming)."""
     logprob_params = generation_result._logprob_params  # should be present and non None
     assert logprob_params is not None
     if generation_result._streaming:
@@ -1628,6 +1632,18 @@ def _compute_pytorch_prompt_logprobs(
             )  # generation logprobs, if requested, is provided directly in response.result.log_probs from the sampler.
     context_logits = response.result.context_logits
     assert context_logits is not None, "context_logits must not be None when prompt_logprobs is requested."
+    prompt_length = len(generation_result._generation_request.prompt_token_ids)
+    origins = response.result.context_logits_origins
+    if (not origins or len(origins) != 1
+            or origins[0].client_id != response.client_id
+            or origins[0].client_id != generation_result._generation_request.id
+            or origins[0].prompt_length != prompt_length
+            or (origins[0].start, origins[0].end) != (0, prompt_length)):
+        raise ValueError(
+            "prompt logprobs require complete original prompt-row origins")
+    if (context_logits.ndim != 2 or context_logits.size(0) != prompt_length):
+        raise ValueError(
+            "prompt logprobs require one context-logit row per prompt token")
     result = response.result.get_result()
     assert result is not None, "result must not be None when prompt_logprobs is requested."
     # Single element list
@@ -1661,7 +1677,6 @@ def _get_logprobs(worker,
     - PyTorch: Generation logprobs computed in sampler, only prompt logprobs computed here
     - TRT: Both prompt and generation logprobs computed here from logits
     """
-
     logprobs_result = None
     generation_result = worker._results.get(response.client_id, None)
 

@@ -37,3 +37,13 @@ dtypes, replay environment variables, and accuracy-validation requirements.
 | Logits Post Processor                                       | Yes               | Yes        | Yes                | Yes                  | Yes                | Yes               | Yes                        | No                    | Yes             | No                            | No                                   | No                                                        | Yes           | Yes            | Yes                      | ---                   |                 |          |
 | Guided Decoding                                             | Yes               | Yes        | Yes                | Yes                  | Yes                | Yes               | Yes                        | Yes                   | Yes             | Yes                           | Yes                                  | Yes                                                       | Yes           | Yes            | Yes                      | Yes                   | ---             |          |
 | LoRA                                                        | Yes               | Yes        | Yes                | Yes                  | Untested           | Untested          | Untested                   | Untested              | Yes             | Untested                      | Untested                             | Untested                                                  | Yes           | Yes            | Yes                      | Yes                   | Untested        | ---      |
+
+## Text watermarking
+
+[Text watermarking](watermarking.md) supplies keyed Gumbel-max sampling in the
+PyTorch backend. Tree, relaxed-acceptance, NGram and user-provided-draft modes
+remain unsupported. DSpark uses the explicitly enabled target-only rejection
+sampling extension described there; parallel-drafter dual-key mode is rejected.
+M3 fused verification that bypasses keyed recovery is disabled when an engine
+has a watermark configuration. Hardware and serving qualification are scoped to
+the tested deployment rather than inferred from this compatibility description.

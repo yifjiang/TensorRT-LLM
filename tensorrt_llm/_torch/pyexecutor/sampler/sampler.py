@@ -29,6 +29,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
@@ -112,6 +113,10 @@ from .two_model_spec_dec import (
     get_rejected_indices,  # noqa: F401  (re-exported for tests via the package __getattr__)
     sample_rejected,  # noqa: F401
 )
+from .watermark import WatermarkHandler
+
+if TYPE_CHECKING:
+    from tensorrt_llm.watermark.config import WatermarkConfig
 
 if sys.version_info[:2] >= (3, 12):
     from typing import override
@@ -514,6 +519,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
     SampleState = SampleStateTorch
 
+    _watermark: WatermarkHandler | None = None
+
     @override
     def get_cache_indirection(self) -> torch.Tensor | None:
         if (beam_search_store := self.store.beam_search_store) is not None:
@@ -587,6 +594,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         disable_overlap_scheduler: bool = False
         enable_async_worker: bool = False
         enable_speculative_beam_history_d2h: bool = False
+        watermark_config: "Optional[WatermarkConfig]" = None
 
     def __init__(self, args: Args):
         self.max_seq_len = args.max_seq_len
@@ -597,6 +605,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         self._batch_fastpath_eligible: bool = self.max_beam_width == 1
         if args.max_total_draft_tokens > 0 and args.max_beam_width > 1:
             raise ValueError("TorchSampler does not support beam search with speculative decoding")
+        if args.watermark_config is not None and args.max_total_draft_tokens > 0:
+            raise ValueError(
+                "watermark_config is not supported with speculative decoding that verifies "
+                "draft tokens in TorchSampler (NGram or user-provided drafts). Disable "
+                "speculative decoding or remove watermark_config."
+            )
         self.max_num_sequences = args.max_num_sequences
         # With the overlap scheduler, sample_async for step i runs before
         # update_requests for step i-1, so the host-side token lists lag the
@@ -672,11 +686,23 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         self._fast_offsets: torch.Tensor | None = None
         # Number of leading rows of the fast-tier buffers the staged batch fills.
         self._fast_num_rows: int = 0
+        self._fast_watermark_enabled: torch.Tensor | None = None
+        self._fast_watermark_flags: tuple[bool, ...] | None = None
 
         # The sampler can be created in inference mode, which disallows
         # in-place mutation of new_tokens. Temporarily exit inference mode.
         with torch.inference_mode(False):
             self.store = self._create_store()
+            self._watermark = (
+                WatermarkHandler(
+                    args.watermark_config,
+                    max_num_sequences=self.max_num_sequences,
+                    max_seq_len=self.max_seq_len,
+                    device="cuda",
+                )
+                if args.watermark_config is not None
+                else None
+            )
             self._request_grouper: _CachingRequestGrouper[Any] = _CachingRequestGrouper(
                 self.max_num_sequences
             )
@@ -761,6 +787,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             make_side_stream_copier=self._make_side_stream_copier,
         )
 
+        from .watermark_runtime import emit_watermark_runtime_identity
+
+        emit_watermark_runtime_identity(
+            "torch_sampler_constructed", self, watermark_config=args.watermark_config,
+            sampler_args=args, handler=self._watermark,
+        )
+
     @staticmethod
     def _is_draft_batch(requests: list[LlmRequest]) -> bool:
         """Whether this batch belongs to the draft model.
@@ -836,6 +869,18 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         """
         return bool(request.py_min_length) or check_stop_words_length(request)
 
+    def _watermark_row_is_neutral(self, request: LlmRequest) -> bool:
+        """Whether the request filters nothing but its temperature (see WatermarkHandler)."""
+        if top_p_decay_active(_request_get_sampling_params(request)):
+            return False
+        # A request's sampling params never change, and this is asked for every request on
+        # every step by the fast-path check: resolve them once.
+        neutral = getattr(request, "py_watermark_neutral", None)
+        if neutral is None:
+            neutral = _request_strategy(request, vocab_size=2**31)[0] == "temperature"
+            request.py_watermark_neutral = neutral
+        return neutral
+
     def _can_use_fast_path(self, requests: list[LlmRequest]) -> bool:
         """Whether every request is plain temperature / top_k / top_p / min_p sampling.
 
@@ -860,6 +905,14 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             # allowed: they only decide when a request finishes, which still
             # runs after the forward.
             if req.py_return_log_probs or self._request_rewrites_logits(req):
+                return False
+            # In-graph the keyed draw runs on the raw logits, which only a row that filters
+            # nothing but its temperature can do.
+            if (
+                self._watermark is not None
+                and self._watermark.requested(req)
+                and not self._watermark_row_is_neutral(req)
+            ):
                 return False
         return True
 
@@ -1118,6 +1171,41 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         seeds_buf[:live_rows].copy_(row_seeds.seed, non_blocking=True)
         offsets_buf[:live_rows].copy_(row_seeds.offset, non_blocking=True)
 
+        watermark = self._watermark
+        if watermark is not None:
+            watermark.invalidate(
+                [
+                    request
+                    for request in requests
+                    if not request.is_dummy
+                    and request.is_context_init_state
+                    and request.is_last_context_chunk
+                ]
+            )
+            watermark.observe(
+                [request for request in requests if not request.is_dummy],
+                is_neutral=self._watermark_row_is_neutral,
+            )
+            flags = [watermark.is_enabled(slot) for slot in live_slots_per_row]
+            flags += [False] * (num_rows - live_rows)
+            if (
+                self._fast_watermark_enabled is None
+                or self._fast_watermark_enabled.numel() < num_rows
+            ):
+                self._fast_watermark_flags = None
+                self._fast_watermark_enabled = torch.zeros(
+                    max(num_rows, self.max_num_sequences * self.max_tokens),
+                    dtype=torch.bool,
+                    device=seeds_buf.device,
+                )
+            flags_key = tuple(flags)
+            if flags_key != self._fast_watermark_flags:
+                self._fast_watermark_flags = flags_key
+                self._fast_watermark_enabled[:num_rows].copy_(
+                    torch.tensor(flags, dtype=torch.bool, pin_memory=prefer_pinned()),
+                    non_blocking=True,
+                )
+
         self._fast_num_rows = num_rows
 
     @override
@@ -1204,6 +1292,19 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             seed=seeds_buf[:num_rows],
             offset=offsets_buf[:num_rows],
         )
+        watermark = self._watermark
+        if watermark is not None:
+            if d2t is not None:
+                raise ValueError("Text watermarking requires target-vocabulary sampling")
+            assert self._fast_watermark_enabled is not None
+            next_tokens = watermark.sample_step(
+                logits_cuda,
+                temperatures_buf[:num_rows],
+                dest_indices,
+                self._fast_watermark_enabled[:num_rows],
+                next_tokens,
+                from_probs=False,
+            )
         if d2t is not None:
             next_tokens = next_tokens + d2t[next_tokens]
         scatter_new_tokens(next_tokens, self.store.new_tokens, dest_indices, self.max_beam_width)
@@ -1927,6 +2028,17 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         cuda_device = logits_cuda.device
 
         self._seed_manager.observe(requests)
+        if self._watermark is not None:
+            self._watermark.invalidate(
+                [
+                    request
+                    for request in requests
+                    if not request.is_dummy
+                    and request.is_context_init_state
+                    and request.is_last_context_chunk
+                ]
+            )
+            self._watermark.observe(requests, is_neutral=self._watermark_row_is_neutral)
 
         grouped_requests, need_raw_logprobs = self._request_grouper.group_requests_by_strategy_key(
             requests,
@@ -2024,6 +2136,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
             # Every row of a fused-kernel group gets its own Philox (seed, offset).
             group_seeds: Optional[RequestSeeds] = None
+            watermark_step = None
             if strategy_key in FUSED_STRATEGY_KEYS:
                 group_slots_per_step = [
                     slot
@@ -2035,6 +2148,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 group_seeds = self._seed_manager.take_row_seeds(
                     group_slots_per_step, device=cuda_device
                 )
+                if self._watermark is not None:
+                    watermark_step = self._watermark.step_inputs(group_slots_per_step)
 
             group_next_tokens_cuda, group_softmax_cuda, group_temperature_cuda = (
                 self._grouped_sampler_cls.sample_grouped_strategies(
@@ -2042,12 +2157,23 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     group_strategies_per_step,
                     group_logits_cuda,
                     generator=generator_cuda,
-                    return_probs=needs_probs,
+                    return_probs=needs_probs or watermark_step is not None,
                     group_logit_indices=logit_indices_for_sampler,
                     group_metadata=group_metadata,
                     seeds=group_seeds,
                 )
             )
+            if watermark_step is not None:
+                assert self._watermark is not None and group_softmax_cuda is not None
+                wm_slots, wm_enabled, _, _ = watermark_step
+                group_next_tokens_cuda = self._watermark.sample_step(
+                    group_softmax_cuda,
+                    None,
+                    wm_slots,
+                    wm_enabled,
+                    group_next_tokens_cuda,
+                    from_probs=True,
+                )
             batch_next_tokens_offset_end = (
                 batch_next_tokens_offset_start + group_next_tokens_cuda.size(0)
             )

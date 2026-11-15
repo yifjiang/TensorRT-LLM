@@ -16,27 +16,28 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
-from ..pyexecutor.config_utils import (is_nemotron_hybrid,
-                                       match_nemotron_h_layer_types)
+from ..pyexecutor.config_utils import is_nemotron_hybrid, match_nemotron_h_layer_types
 from ..pyexecutor.guided_decoder import GuidedDecoder
 from ..pyexecutor.sampler import TorchSampler
-from ..speculative.interface import SpecMetadata
+from ..pyexecutor.sampler.watermark import WatermarkSpecState
+from ..speculative.interface import SpecMetadata, get_force_num_accepted_tokens_float
 from .dflash import DFlashSpecMetadata, DFlashWorker
-from .draft_target import (DraftTargetOneModelSpecMetadata,
-                           DraftTargetOneModelWorker)
+from .draft_target import DraftTargetOneModelSpecMetadata, DraftTargetOneModelWorker
 from .dspark import DSparkSpecMetadata, DSparkWorker, DSv4DSparkWorker
-from .eagle3 import (Eagle3OneModelDynamicTreeResourceManager,
-                     Eagle3OneModelSpecMetadata, Eagle3OneModelWorker,
-                     Eagle3ResourceManager, MTPEagleWorker)
+from .eagle3 import (
+    Eagle3OneModelDynamicTreeResourceManager,
+    Eagle3OneModelSpecMetadata,
+    Eagle3OneModelWorker,
+    Eagle3ResourceManager,
+    MTPEagleWorker,
+)
 from .eagle3_dynamic_tree import Eagle3OneModelDynamicTreeWorker
 from .mtp import MTPHiddenStatesManager, MTPSpecMetadata, MTPWorker
-from .mtp_dynamic_tree import (MTPEagleDynamicTreeResourceManager,
-                               MTPEagleDynamicTreeWorker)
+from .mtp_dynamic_tree import MTPEagleDynamicTreeResourceManager, MTPEagleDynamicTreeWorker
 from .ngram import NGramDrafter, NGramPoolManager
 from .pard import PARDSpecMetadata, PARDWorker
 from .sa_worker import SASpecMetadata, SAWorker
-from .save_hidden_state import (SaveHiddenStatesResourceManager,
-                                SaveHiddenStatesSpecMetadata)
+from .save_hidden_state import SaveHiddenStatesResourceManager, SaveHiddenStatesSpecMetadata
 from .spec_sampler_base import SpecSampler
 from .suffix_automaton import SuffixAutomatonManager
 
@@ -213,8 +214,7 @@ def resolve_mtp_checkpoint_source(spec_config, checkpoint_dir) -> None:
     keep that behavior instead of switching to the separate-heads load path,
     which the target checkpoint's key layout may not even satisfy.
     """
-    from tensorrt_llm.llmapi.llm_args import (MTPDecodingConfig,
-                                              _MTPDraftCheckpointType)
+    from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig, _MTPDraftCheckpointType
     if not isinstance(spec_config, MTPDecodingConfig):
         return
     if spec_config.speculative_model is None:
@@ -340,7 +340,8 @@ def get_spec_metadata(spec_config,
                       max_num_tokens,
                       spec_resource_manager=None,
                       max_seq_len=262144,
-                      num_seq_slots=None):
+                      num_seq_slots=None,
+                      watermark_config=None):
     metadata = _build_spec_metadata(spec_config,
                                     model_config,
                                     max_num_requests,
@@ -362,6 +363,8 @@ def get_spec_metadata(spec_config,
         metadata.rejection_sample_method = spec_config.rejection_sample_method
         if num_seq_slots is not None:
             metadata.num_seq_slots = num_seq_slots
+        if watermark_config is not None:
+            metadata.watermark = WatermarkSpecState(watermark_config, max_seq_len=max_seq_len)
     return metadata
 
 
@@ -653,6 +656,56 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
     return None
 
 
+def _watermark_unsupported_reason(spec_config,
+                                  watermark_config=None) -> Optional[str]:
+    """Why text watermarking cannot be served by this one-model configuration, or None.
+
+    With exact-match verification the watermark relies on the target's own sample at every
+    verified position, committed in order. Tree rows follow root paths and relaxed
+    acceptance commits non-matching tokens, so neither is supported. Rejection sampling
+    accepts drafts that the target did not sample: it needs either dual-key watermarking
+    (the drafts are drawn under one key, the token after the accepted prefix under a second
+    one) or the explicit opt-in to leave accepted drafts unmarked.
+    """
+    if watermark_config is not None and get_force_num_accepted_tokens_float() != 0.0:
+        return ("Text watermarking is not supported with forced speculative acceptance. "
+                "Unset TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS.")
+    if watermark_config is not None and spec_config.spec_dec_mode.is_dspark():
+        if (watermark_config.algorithm != "gumbel"
+                or not watermark_config.allow_target_only_watermarking
+                or not getattr(spec_config, "use_rejection_sampling", False)):
+            return ("DSpark text watermarking requires algorithm='gumbel', "
+                    "allow_target_only_watermarking=True and use_rejection_sampling=True. "
+                    "Dual-key and exact-match DSpark watermarking are unsupported.")
+    if _is_effective_dynamic_tree(spec_config):
+        return (
+            "Text watermarking is not supported with tree (dynamic tree) speculative "
+            "decoding. Use a linear speculation mode or disable speculative decoding."
+        )
+    if (getattr(spec_config, "use_rejection_sampling", False)
+            and watermark_config is not None):
+        dual_key = watermark_config.algorithm == "gumbel_dual_key"
+        if not dual_key and not watermark_config.allow_target_only_watermarking:
+            return (
+                "Text watermarking with use_rejection_sampling needs "
+                "watermark_config.algorithm='gumbel_dual_key', or "
+                "allow_target_only_watermarking=True to leave accepted draft tokens "
+                "unmarked (the signal weakens with the acceptance rate). Alternatively "
+                "disable use_rejection_sampling to keep exact-match verification."
+            )
+        if dual_key and spec_config.spec_dec_mode.is_parallel_draft():
+            return (
+                "watermark_config.algorithm='gumbel_dual_key' is not supported "
+                "with parallel-draft speculation. Use an autoregressive drafter "
+                "(Eagle3, MTP, DraftTarget) or allow_target_only_watermarking=True."
+            )
+    if getattr(spec_config, "use_relaxed_acceptance_for_thinking", False):
+        return (
+            "Text watermarking is not supported with relaxed acceptance for thinking. "
+            "Disable use_relaxed_acceptance_for_thinking.")
+    return None
+
+
 def get_spec_decoder(
     sampler_args: TorchSampler.Args,
     spec_config: "DecodingBaseConfig",
@@ -674,7 +727,10 @@ def get_spec_decoder(
         return SpecSampler(sampler_args,
                            enable_penalty=spec_config.enable_penalty,
                            penalty_supported=penalty_supported,
-                           fused_sampling=fused_sampling)
+                           fused_sampling=fused_sampling,
+                           supports_min_tokens=spec_dec_mode.is_dspark(),
+                           watermark_unsupported_reason=_watermark_unsupported_reason(
+                               spec_config, sampler_args.watermark_config))
     raise ValueError(
         f"Unsupported speculative decoding mode: {spec_config.spec_dec_mode}")
 
@@ -835,8 +891,7 @@ def get_draft_kv_cache_manager(spec_config, resource_manager):
 def update_spec_config_from_model_config(spec_config,
                                          model_config,
                                          target_model_cls=None):
-    from tensorrt_llm.llmapi.llm_args import (MTPDecodingConfig,
-                                              _MTPDraftCheckpointType)
+    from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig, _MTPDraftCheckpointType
     if not isinstance(spec_config, MTPDecodingConfig):
         return
 

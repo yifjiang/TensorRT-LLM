@@ -470,12 +470,12 @@ class DecoderRunner(ScheduledModelRunner):
         kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
         # The MSA prewarm scope closes after the timed warmup: its end-of-warmup
         # sparse-decode prewarm is not one of the warmup timer's phases.
-        with self._msa_prewarm_scope():
+        with self._msa_prewarm_scope(kv_cache_manager):
             # Retain a partial summary when a phase raises.
             with self._warmup_timer:
                 self._warmup_scheduled(resource_manager, kv_cache_manager)
 
-    def _msa_prewarm_scope(self) -> contextlib.AbstractContextManager:
+    def _msa_prewarm_scope(self, kv_cache_manager) -> contextlib.AbstractContextManager:
         """MiniMax-M3 MSA prewarm phase scope (m3ax_msa_prewarm); a no-op for other runners."""
         sparse_config = self.sparse_attention_config
         if (
@@ -484,10 +484,10 @@ class DecoderRunner(ScheduledModelRunner):
         ):
             return contextlib.nullcontext()
         from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.m3ax_msa_prewarm import (
-            hook as msa_prewarm_hook,
+            integration as msa_prewarm_integration,
         )
 
-        return msa_prewarm_hook.warmup_scope(self)
+        return msa_prewarm_integration.warmup_scope(self, kv_cache_manager)
 
     def release_graphs(self) -> None:
         self._release_decoder_graphs()
@@ -5033,6 +5033,10 @@ class DecoderRunner(ScheduledModelRunner):
                 scheduled_requests, self._is_final_multimodal_context_decode_compatible
             )
 
+        if spec_metadata is not None and self._config.watermark_config is not None:
+            spec_metadata.prepare_watermark_buffers()
+            spec_metadata._populate_watermark_params(tuple(semantic_requests.all_requests()))
+
         with self.cuda_graph_runner.pad_batch(
             graph_requests, resource_manager, runtime_draft_len
         ) as padded_graph_requests:
@@ -5275,7 +5279,10 @@ class DecoderRunner(ScheduledModelRunner):
             if not isinstance(outputs, dict):
                 return outputs
             outputs = self._restore_attention_dp_semantic_outputs(semantic_requests, outputs)
-            return {**outputs, "runtime_draft_len": runtime_draft_len}
+            result = {**outputs, "runtime_draft_len": runtime_draft_len}
+            if spec_metadata is not None and spec_metadata.watermark is not None:
+                result["watermark_state"] = spec_metadata.watermark
+            return result
 
     @contextmanager
     def _maybe_bypass_torch_compile(self, bypass: bool = False) -> Iterator[None]:

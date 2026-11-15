@@ -13,6 +13,8 @@ features produced by the tower.
 
 from __future__ import annotations
 
+import math
+import numbers
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -878,11 +880,10 @@ def extract_multimodal_items_in_request_order(
     Where :func:`extract_multimodal_data_from_params` concatenates all
     image rows together and all video rows together (image-first
     bucketing), this helper keeps the natural left-to-right request
-    order. Each MultimodalParams contributes at most one image item and
-    at most one video item — within a single request the M3 processor
-    expands all image placeholders first, then all video placeholders,
-    so a request that carries both modalities still emits image then
-    video in left-to-right order.
+    order. A mixed token-ID request records an explicit ``mm_item_order``
+    after validating its placeholders. Honor that order rather than
+    putting its image rows before its video rows. Legacy single-modality
+    payloads keep their existing image-then-video bucket order.
 
     Returned list element schema:
         {
@@ -898,12 +899,13 @@ def extract_multimodal_items_in_request_order(
         data = getattr(params, "multimodal_data", None)
         if not data:
             continue
+        request_items: Dict[str, Dict[str, Any]] = {}
         img = data.get("image") if isinstance(data, Mapping) else None
         if isinstance(img, Mapping):
             pv = img.get("pixel_values")
             gthw = img.get("image_grid_thw")
             if pv is not None and gthw is not None:
-                items.append({"modality": "image", "pixel_values": pv, "grid_thw": gthw})
+                request_items["image"] = {"modality": "image", "pixel_values": pv, "grid_thw": gthw}
         vid = data.get("video") if isinstance(data, Mapping) else None
         if isinstance(vid, Mapping):
             pv = vid.get("pixel_values_videos")
@@ -911,7 +913,25 @@ def extract_multimodal_items_in_request_order(
                 pv = vid.get("pixel_values")
             gthw = vid.get("video_grid_thw")
             if pv is not None and gthw is not None:
-                items.append({"modality": "video", "pixel_values": pv, "grid_thw": gthw})
+                request_items["video"] = {"modality": "video", "pixel_values": pv, "grid_thw": gthw}
+        layout = data.get("layout_metadata") if isinstance(data, Mapping) else None
+        order = layout.get("mm_item_order") if isinstance(layout, Mapping) else None
+        if order is None:
+            items.extend(request_items.values())
+        else:
+            # The mixed fast path currently admits exactly one item of each
+            # modality. A video may still contain multiple temporal grids.
+            if (
+                not isinstance(order, list)
+                or len(order) != len(request_items)
+                or any(not isinstance(entry, Mapping) for entry in order)
+                or any(entry.get("index") != 0 for entry in order)
+                or {entry.get("modality") for entry in order} != set(request_items)
+            ):
+                raise ValueError(
+                    "MiniMaxM3VL mixed media order does not match its encoded payload."
+                )
+            items.extend(request_items[entry["modality"]] for entry in order)
     return items
 
 
@@ -1851,22 +1871,32 @@ class MiniMaxM3VLInputProcessor:
         if self._processor is None:
             from transformers import AutoProcessor
 
-            processor = AutoProcessor.from_pretrained(
-                self._model_path,
-                use_fast=self._use_fast,
-                trust_remote_code=self._trust_remote_code,
-            )
-            if getattr(processor, "image_processor", None) is None:
-                raise ValueError(
-                    "MiniMax-M3 image and video inputs need an HF processor with an "
-                    f"image processor, but AutoProcessor.from_pretrained({self._model_path!r}) "
-                    f"returned {type(processor).__name__}, which has none: the checkpoint "
-                    "ships no processor this transformers version can load. Text-only "
-                    "requests are unaffected. For image or video requests, serve a model "
-                    "directory whose processor loads with AutoProcessor (for example, "
-                    "processor code registered through an auto_map entry)."
-                )
-            self._processor = processor
+            from tensorrt_llm._torch.model_config import hf_remote_code_lock
+
+            # The first load publishes the checkpoint's remote-code files into
+            # the shared HF module cache; the lock serializes that publication
+            # across ranks and request threads (``create_input_processor``
+            # holds the same lock around construction), and the re-check keeps
+            # concurrent first requests from building two processors.
+            with hf_remote_code_lock():
+                if self._processor is None:
+                    processor = AutoProcessor.from_pretrained(
+                        self._model_path,
+                        use_fast=self._use_fast,
+                        trust_remote_code=self._trust_remote_code,
+                    )
+                    if getattr(processor, "image_processor", None) is None:
+                        raise ValueError(
+                            "MiniMax-M3 image and video inputs need an HF processor with an "
+                            "image processor, but "
+                            f"AutoProcessor.from_pretrained({self._model_path!r}) returned "
+                            f"{type(processor).__name__}, which has none: the checkpoint ships "
+                            "no processor this transformers version can load. Text-only "
+                            "requests are unaffected. For image or video requests, serve a "
+                            "model directory whose processor loads with AutoProcessor (for "
+                            "example, processor code registered through an auto_map entry)."
+                        )
+                    self._processor = processor
         return self._processor
 
     @property
@@ -1897,6 +1927,56 @@ class MiniMaxM3VLInputProcessor:
         if isinstance(value, (list, tuple)):
             return list(value)
         return [value]
+
+    @staticmethod
+    def _is_float_media(media: Any) -> bool:
+        return isinstance(media, torch.Tensor) and media.is_floating_point()
+
+    @classmethod
+    def _prepare_media(
+        cls, items: Sequence[Any], modality: str
+    ) -> Tuple[List[Any], Dict[str, Any]]:
+        """One modality's media items as the HF processor takes them, plus its kwargs.
+
+        The checkpoint's image and video processors rescale by 1/255
+        themselves. Float [0, 1] tensors (media_io's ``pt`` format) are
+        therefore handed over as they are with ``do_rescale=False``, and the
+        processor normalizes them directly; uint8 tensors, arrays and PIL
+        images keep the default rescale. One call serves a whole modality, so
+        when a request mixes the two forms the float items are converted to
+        uint8 HWC arrays and the default rescale serves all of them. The only
+        float layout accepted is the one media_io produces, ``[C, H, W]`` with
+        1 or 3 channels and finite values in [0, 1]: anything else would be
+        normalized silently wrong, so it is rejected instead.
+        """
+        items = list(items)
+        float_items = [m for m in items if cls._is_float_media(m)]
+        if not float_items:
+            return items, {}
+        for media in float_items:
+            if media.dim() != 3 or media.shape[0] not in (1, 3):
+                raise ValueError(
+                    "MiniMax-M3 VL: float media must be a [C, H, W] tensor with 1 or 3 "
+                    f"channels (media_io's 'pt' format), got shape {tuple(media.shape)}."
+                )
+            lo, hi = torch.aminmax(media)
+            if (
+                not (torch.isfinite(lo) and torch.isfinite(hi))
+                or float(lo) < 0.0
+                or float(hi) > 1.0
+            ):
+                raise ValueError(
+                    "MiniMax-M3 VL: float media must hold finite values scaled to [0, 1]; "
+                    "pass uint8 data for [0, 255] values."
+                )
+        if len(float_items) == len(items):
+            return items, {"do_rescale": False}
+        return [cls._as_uint8_hwc(m) if cls._is_float_media(m) else m for m in items], {}
+
+    @staticmethod
+    def _as_uint8_hwc(media: torch.Tensor) -> np.ndarray:
+        """A validated float [0, 1] ``[C, H, W]`` tensor as the uint8 HWC array it came from."""
+        return (media.detach().cpu().permute(1, 2, 0) * 255.0).round().to(torch.uint8).numpy()
 
     # ----- tokenized + MM fast-path hooks ---------------------------------
     # Implementing these lets the runtime accept
@@ -1954,10 +2034,10 @@ class MiniMaxM3VLInputProcessor:
         The HF processor expands one ``]<]video[>[`` marker into one bracket
         per temporal patch, ``VISION_START + VIDEO_TOKEN * (grid_h*grid_w /
         merge^2) + VISION_END`` repeated ``grid_t`` times, so the count is
-        ``grid_t * (grid_h*grid_w / merge^2 + 2)``. The brackets are
-        adjacent: the processor prefixes a timestamp only when the video
-        carries fps metadata, and the frame lists handed over here carry
-        none.
+        ``grid_t * (grid_h*grid_w / merge^2 + 2)``. A video with timing
+        also gets a timestamp before each bracket (see
+        :meth:`_video_timestamp_ids`); those are plain text tokens, outside
+        the multimodal mask, so they are not counted here.
 
         ``video_grid_thw`` is the processor's grid for this video,
         computed by the dummy-text pass of :func:`find_mm_token_lengths`
@@ -1975,13 +2055,12 @@ class MiniMaxM3VLInputProcessor:
         return int((grid[:, 0] * per_patch).sum().item())
 
     def get_preferred_media_io_kwargs(self) -> Dict[str, Dict[str, Any]]:
-        # uint8 HWC arrays for both modalities. The checkpoint's image and
-        # video processors rescale by 1/255 themselves (``do_rescale``);
-        # media_io's default "pt" format delivers float [0, 1] tensors, which
-        # they rescale a second time, and the vision tower then sees an
-        # almost black input. trtllm-serve seeds its media_io defaults from
-        # this method, so no --media_io_kwargs flag is needed; an explicit
-        # flag still wins.
+        # uint8 HWC arrays for both modalities: the form the checkpoint's
+        # processors rescale themselves, at a quarter of the bytes of
+        # media_io's default "pt" float tensors (which ``_prepare_media``
+        # also accepts). trtllm-serve seeds its media_io defaults from this
+        # method, so no --media_io_kwargs flag is needed; an explicit flag
+        # still wins.
         return {"image": {"format": "np"}, "video": {"format": "np"}}
 
     @staticmethod
@@ -1990,6 +2069,88 @@ class MiniMaxM3VLInputProcessor:
         if hasattr(video, "frames"):
             return list(video.frames)
         return list(video) if isinstance(video, (list, tuple)) else [video]
+
+    @staticmethod
+    def _video_metadata(video: Any, num_frames: int) -> Dict[str, Any]:
+        """Timing of one raw video item, in the form the HF video processor takes.
+
+        ``VideoData.metadata`` carries the source ``fps`` and the indices of
+        the sampled frames. With both, the processor writes a
+        ``]<]{t} seconds[>[`` timestamp before each temporal group. A video
+        without usable timing (no metadata, ``fps`` missing or not a finite
+        positive number, or not one non-negative integer frame index per
+        delivered frame) gets ``fps=None`` and no timestamps, with a debug log
+        when metadata was given. Frame indices may be a list, a tensor, an
+        array, or a list of 0-d tensors or numpy scalars. Only the keys
+        transformers' ``VideoMetadata`` accepts are passed, and
+        ``total_num_frames`` is the number of frames delivered, because the
+        media loader has already sampled them.
+        """
+        metadata = getattr(video, "metadata", None)
+        metadata = metadata if isinstance(metadata, Mapping) else {}
+        fps = metadata.get("fps")
+        indices = metadata.get("frames_indices")
+        # Check the values of a tensor or array, and of 0-d tensors or numpy scalars in a list.
+        frames_indices = indices.tolist() if hasattr(indices, "tolist") else indices
+        if isinstance(frames_indices, Sequence):
+            frames_indices = [i.tolist() if hasattr(i, "tolist") else i for i in frames_indices]
+        if (
+            not isinstance(fps, numbers.Real)
+            or isinstance(fps, bool)
+            or not math.isfinite(fps)
+            or fps <= 0
+            or not isinstance(frames_indices, Sequence)
+            or len(frames_indices) != num_frames
+            or not all(
+                isinstance(i, numbers.Integral) and not isinstance(i, bool) and i >= 0
+                for i in frames_indices
+            )
+        ):
+            if metadata:
+                from tensorrt_llm.logger import logger
+
+                logger.debug(
+                    f"MiniMax-M3 video metadata has no usable timing (fps={fps!r}, "
+                    f"frames_indices of type {type(indices).__name__} for "
+                    f"{num_frames} frames); the video gets no timestamps."
+                )
+            fps, frames_indices = None, range(num_frames)
+        return {
+            "total_num_frames": num_frames,
+            "fps": None if fps is None else float(fps),
+            "duration": metadata.get("duration"),
+            "frames_indices": [int(i) for i in frames_indices],
+        }
+
+    def _video_timestamp_ids(self, video: Any, brackets: int) -> List[List[int]]:
+        """Token ids of the timestamp the processor writes before each bracket of a video.
+
+        For a video with timing (see :meth:`_video_metadata`), bracket ``b``
+        gets ``]<]{t:.1f} seconds[>[``, where
+        ``t = frames_indices[min(b * temporal_patch_size, n - 1)] / fps``, as
+        the checkpoint's processor writes it; a video without timing gets none.
+
+        Each timestamp is encoded on its own. That gives the processor's ids
+        after a VISION_END, where the tokenizer splits the processor's text at
+        the special token. Before the first bracket the processor's text
+        continues the prompt text before the marker: when that text ends in,
+        for example, a space or a period, the tokenizer merges it with the
+        timestamp, which prompt ids tokenized around the marker cannot
+        reproduce, and the first timestamp's ids differ. A newline before the
+        marker, as in trtllm-serve's rendered prompts, gives the same ids.
+        """
+        metadata = self._video_metadata(video, len(self._video_frames(video)))
+        if metadata["fps"] is None:
+            return [[] for _ in range(brackets)]
+        temporal = int(self.processor.video_processor.temporal_patch_size)
+        indices = metadata["frames_indices"]
+        times = [
+            indices[min(b * temporal, len(indices) - 1)] / metadata["fps"] for b in range(brackets)
+        ]
+        return [
+            self._tokenizer.encode(f"]<]{t:.1f} seconds[>[", add_special_tokens=False)
+            for t in times
+        ]
 
     def _video_bracket_count(self, video: Any) -> int:
         """Temporal patches of a video item: one framed bracket each.
@@ -2023,7 +2184,9 @@ class MiniMaxM3VLInputProcessor:
         (which already accounts for the +2 framing per bracket). An image is
         one bracket; a video is one bracket per temporal patch, as the
         processor lays it out (see :meth:`get_num_tokens_per_video`), so the
-        placeholder runs line up with the vision rows at merge time.
+        placeholder runs line up with the vision rows at merge time. A video
+        with timing gets the processor's timestamp before each bracket (see
+        :meth:`_video_timestamp_ids`); one without keeps adjacent brackets.
         """
         mm_data = mm_data or {}
         has_image = bool(mm_data.get("image"))
@@ -2049,6 +2212,7 @@ class MiniMaxM3VLInputProcessor:
                     f"num_mm_tokens entries ({expected})."
                 )
             brackets = self._video_bracket_count(items[consumed]) if has_video else 1
+            stamps = self._video_timestamp_ids(items[consumed], brackets) if has_video else [[]]
             total = int(num_mm_tokens_per_placeholder[consumed])
             inner, remainder = divmod(total - 2 * brackets, brackets)
             if inner < 1 or remainder:
@@ -2056,7 +2220,8 @@ class MiniMaxM3VLInputProcessor:
                     f"MiniMaxM3VL fast path: num_mm_tokens[{consumed}]={total} must be "
                     f"{brackets} x (VISION_START + >=1 placeholder + VISION_END)."
                 )
-            for _ in range(brackets):
+            for stamp in stamps:
+                expanded.extend(stamp)
                 expanded.append(self._vision_start_token_id)
                 expanded.extend([placeholder_id] * inner)
                 expanded.append(self._vision_end_token_id)
@@ -2069,6 +2234,97 @@ class MiniMaxM3VLInputProcessor:
         return expanded, None
 
     # ----- main entry point -----------------------------------------------
+    def call_with_token_ids(
+        self,
+        inputs: Dict[str, Any],
+        sampling_params: Any = None,
+    ) -> Tuple[List[int], Optional[Dict[str, Any]]]:
+        """Keep one image and one video in their actual token-placeholder order.
+
+        The base token-ID path asks for the first modality's token lengths.
+        That is insufficient for mixed media: each modality has a distinct
+        length and the video includes temporal brackets/timestamps. Process
+        both once, then expand each real placeholder with its own length.
+        """
+        from tensorrt_llm.inputs.multimodal import find_mm_token_lengths
+        from tensorrt_llm.inputs.registry import (
+            BaseMultimodalInputProcessor,
+            _mm_item_order_signature,
+            _process_multimodal_with_dummy_placeholders,
+        )
+
+        mm_data = inputs.get("multi_modal_data") or {}
+        images = self._coerce_to_list(mm_data.get("image"))
+        videos = self._coerce_to_list(mm_data.get("video"))
+        if not (images and videos):
+            return BaseMultimodalInputProcessor.call_with_token_ids(self, inputs, sampling_params)
+        # Without per-video grid boundaries the processor's concatenated
+        # video_grid_thw cannot safely be split between multiple videos.
+        if len(images) != 1 or len(videos) != 1:
+            raise ValueError(
+                "MiniMaxM3VL mixed token-ID requests require exactly one image and one video."
+            )
+        if self._image_token_id == self._video_token_id:
+            raise ValueError("MiniMaxM3VL mixed media requires distinct image and video token IDs.")
+        ids = list(inputs["prompt_token_ids"])
+        token_modalities = {self._image_token_id: "image", self._video_token_id: "video"}
+        order = [
+            {"modality": token_modalities[token], "index": 0}
+            for token in ids
+            if token in token_modalities
+        ]
+        if len(order) != 2 or {entry["modality"] for entry in order} != {"image", "video"}:
+            raise ValueError(
+                "MiniMaxM3VL mixed prompt must contain one placeholder for each supplied modality."
+            )
+        if inputs.get("mm_item_order") and _mm_item_order_signature(
+            inputs["mm_item_order"]
+        ) != _mm_item_order_signature(order):
+            raise ValueError(
+                "MiniMaxM3VL incoming media order conflicts with its actual prompt placeholders."
+            )
+        extra = _process_multimodal_with_dummy_placeholders(
+            self,
+            mm_data,
+            {"image": 1, "video": 1},
+            inputs.get("mm_processor_kwargs"),
+            sampling_params,
+        )
+        multimodal_data = extra.get("multimodal_data")
+        if not isinstance(multimodal_data, dict):
+            raise ValueError("MiniMaxM3VL mixed processor returned no encoded media payload.")
+        lengths = find_mm_token_lengths(mm_data, self, multimodal_data=multimodal_data)
+        if set(lengths) != {"image", "video"} or any(
+            len(lengths[modality]) != 1 for modality in lengths
+        ):
+            raise ValueError(
+                "MiniMaxM3VL mixed processor returned ambiguous per-modality token lengths."
+            )
+        expanded: List[int] = []
+        for token in ids:
+            modality = token_modalities.get(token)
+            if modality is None:
+                expanded.append(int(token))
+                continue
+            # Reuse the existing single-modality framing/timestamp contract.
+            item_ids, updates = self.expand_prompt_token_ids_for_mm(
+                [token],
+                lengths[modality],
+                hf_processor_mm_kwargs=inputs.get("mm_processor_kwargs"),
+                mm_data={modality: mm_data[modality]},
+            )
+            if updates:
+                raise ValueError(
+                    "MiniMaxM3VL mixed expansion returned unexpected auxiliary updates."
+                )
+            expanded.extend(item_ids)
+        # The same manifest drives hashing and vision-feature concatenation.
+        layout = multimodal_data.setdefault("layout_metadata", {})
+        if not isinstance(layout, dict):
+            raise ValueError("MiniMaxM3VL mixed processor returned ambiguous layout metadata.")
+        layout["mm_item_order"] = order
+        return expanded, extra
+
     # Implements the ``call_with_text_prompt`` hook required by
     # :class:`BaseMultimodalInputProcessor`. The base class's ``__call__``
     # dispatches text-prompt (with or without MM data) requests here and
@@ -2118,7 +2374,7 @@ class MiniMaxM3VLInputProcessor:
         # The HF MiniMaxVLProcessor expects video frames as nested lists
         # of frames (one list per video). Accept either pre-extracted
         # frames or wrapper objects with a ``frames`` attribute.
-        videos: List[Any] = [self._video_frames(v) for v in video_inputs]
+        videos: List[List[Any]] = [self._video_frames(v) for v in video_inputs]
 
         # The ``MiniMaxVLProcessor`` expands each ``IMAGE_TOKEN`` /
         # ``VIDEO_TOKEN`` marker in place into
@@ -2200,10 +2456,30 @@ class MiniMaxM3VLInputProcessor:
         # frames arrive here as is, so let the processor resize them: frame
         # sides must be multiples of ``patch_size * merge_size`` for its
         # patch view, and its ``max_pixels`` bounds the token count. Images
-        # are resized by default.
+        # are resized by default. The kwargs are per-modality dicts so each
+        # modality is rescaled for its own format (``_prepare_media``).
         processor_kwargs: Dict[str, Any] = {}
+        if images:
+            images, image_kwargs = self._prepare_media(images, "image")
+            if image_kwargs:
+                processor_kwargs["images_kwargs"] = image_kwargs
         if videos:
-            processor_kwargs["videos_kwargs"] = {"do_resize": True}
+            flat_frames, video_kwargs = self._prepare_media(
+                [frame for frames in videos for frame in frames], "video"
+            )
+            frame_iter = iter(flat_frames)
+            videos = [[next(frame_iter) for _ in frames] for frames in videos]
+            processor_kwargs["videos_kwargs"] = {"do_resize": True, **video_kwargs}
+            # Frame timing goes in only when some video has it; the others get
+            # fps=None, so the processor gives timestamps to exactly the videos
+            # with timing. ``expand_prompt_token_ids_for_mm`` writes the same
+            # timestamps on the token-ID fast path.
+            video_metadata = [
+                self._video_metadata(video, len(frames))
+                for video, frames in zip(video_inputs, videos)
+            ]
+            if any(m["fps"] is not None for m in video_metadata):
+                processor_kwargs["videos_kwargs"]["video_metadata"] = video_metadata
         processed = self.processor(
             text=[templated_text],
             images=images if images else None,

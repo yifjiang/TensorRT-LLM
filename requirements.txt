@@ -48,7 +48,9 @@ pydantic-settings[yaml]
 msgspec
 omegaconf
 pillow
-PyNvVideoCodec~=2.1.0
+# Match the production NVDEC/FFmpeg profile; media.decoding uses the supported
+# callback demuxer, low-level decoder, RGB and DLPack APIs in this exact release.
+PyNvVideoCodec==2.2.3
 optimum
 datasets
 evaluate
@@ -60,12 +62,13 @@ pyzmq
 fastapi>=0.136.3,<0.140.0
 starlette>=1.3.1
 uvicorn
-setuptools<80
+# Match the authenticated production provider and ModelOpt>=80.
+# Required setup APIs are verified on the exact81 wheel; runtime has no pkg_resources callers.
+setuptools==81.0.0
 # FlashInfer source builds (--no-build-isolation) need packaging>=24.2 for setuptools license-expression validation
 packaging>=24.2
 ordered-set
 peft>=0.18.1,<0.19.0
-patchelf
 einops
 fla-core==0.5.2 # the Kimi Linear / Kimi K3 KDA layers import fla.modules and fla.ops when they load
 flashinfer-python==0.6.18
@@ -90,7 +93,6 @@ blobfile
 openai-harmony==0.0.4
 # 4.8.0.dev0 is the first release exposing Rubin/SM107.
 nvidia-cutlass-dsl[cu13]==4.8.0; python_version >= "3.10" # required by PrimTS task-scheduled kernels and Rubin CuTe DSL kernels
-nvidia-matmul-heuristics==0.1.0.27; python_version >= "3.10" # analytic GEMM heuristics for CuTe DSL autotuner tactic pruning
 quack-kernels==0.5.0; python_version >= "3.10" # required for MiniMax-M3 MSA and FlashAttention 4; only published release compatible with CUTLASS DSL >= 4.7
 jinja2 # required for MinimaxM3 MSA
 plotly
@@ -106,7 +108,9 @@ cuda-core
 llist
 cuda-tile>=1.0.1
 nvidia-cuda-tileiras>=13.1,<13.2
-nvidia-cudnn-frontend>=1.27.0,<1.28
+# Exact provider profile reviewed against the visual-generation SDPA caller.
+# Transformer Engine 2.19 requires 1.28; each later release needs fresh ABI tests.
+nvidia-cudnn-frontend==1.28.0
 etcd-sdk-python==0.0.7
 # Required by the checked-in OpenEngine gRPC bindings.
 grpcio>=1.67.1,<2
@@ -115,7 +119,6 @@ grpcio>=1.67.1,<2
 protobuf>=6.30.2,<7
 python-multipart
 cache-dit>=1.3.5
-librosa
 msgpack
 uvloop>=0.19.0,<0.23.0
 mooncake-transfer-engine-cuda13==0.3.13

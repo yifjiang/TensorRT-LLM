@@ -446,6 +446,15 @@ class RequestBroadcaster:
             new_requests, "py_conversation_params", include_none=True
         )
         py_lora_path = collect_py_objects_from_requests(new_requests, "py_lora_path")
+        watermarking_by_request_id = {
+            item.id: getattr(item.request, "py_watermarking", None)
+            for item in new_requests
+            if item.is_normal_request and item.request
+        }
+        py_watermarking = (
+            ("py_watermarking", watermarking_by_request_id)
+            if watermarking_by_request_id else None
+        )
 
         return tuple(
             filter(
@@ -458,6 +467,7 @@ class RequestBroadcaster:
                     py_disaggregated_params,
                     py_conversation_params,
                     py_lora_path,
+                    py_watermarking,
                 ],
             )
         )

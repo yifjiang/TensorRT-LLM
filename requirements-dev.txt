@@ -1,4 +1,8 @@
 -r requirements.txt
+-r requirements-audio.txt
+-r requirements-cutedsl-heuristics.txt
+# RPATH editing is a wheel-build tool, not an inference dependency.
+patchelf==0.19.3.0; sys_platform != "win32"
 # Pin the exact diffusers version VisualGen LPIPS tests run against; install it
 # before pytest collection so already-imported Diffusers modules match the
 # package files. 0.40.0 provides the MiniMax-H3 reference implementation.

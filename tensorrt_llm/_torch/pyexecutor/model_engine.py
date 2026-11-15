@@ -7,8 +7,7 @@ import os
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from contextlib import contextmanager
-from typing import (Any, Callable, Dict, Hashable, List, Optional, Tuple, Type,
-                    Union)
+from typing import Any, Callable, Dict, Hashable, List, Optional, Tuple, Type, Union
 
 import torch
 import torch._dynamo.config
@@ -18,19 +17,21 @@ from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
 from tensorrt_llm._utils import release_gc
-from tensorrt_llm.inputs.registry import (BaseMultimodalInputProcessor,
-                                          create_input_processor)
-from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, DecodingBaseConfig,
-                                          EncodeCudaGraphConfig,
-                                          PrefillCudaGraphBackend,
-                                          TorchCompileConfig, TorchLlmArgs)
+from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor, create_input_processor
+from tensorrt_llm.llmapi.llm_args import (
+    CudaGraphConfig,
+    DecodingBaseConfig,
+    EncodeCudaGraphConfig,
+    PrefillCudaGraphBackend,
+    TorchCompileConfig,
+    TorchLlmArgs,
+)
 
 # isort: split
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ..attention.backends.interface import (AttentionMetadata,
-                                            AttentionRuntimeFeatures)
+from ..attention.backends.interface import AttentionMetadata, AttentionRuntimeFeatures
 from ..attention.backends.utils import get_attention_backend
 from ..compilation.backend import Backend
 from ..distributed import Distributed
@@ -51,21 +52,29 @@ from .cuda_graph_runner import CUDAGraphRunner
 from .engine.cuda_graph import filter_cuda_graph_batch_sizes
 from .engine.lora import make_lora_model_config
 from .engine.model_call import ModelCaller
-from .engine.multimodal import (MultimodalItemScheduler, is_multimodal,
-                                mm_encoder_cache_enabled,
-                                setup_mm_encoder_attn_metadata)
+from .engine.multimodal import (
+    MultimodalItemScheduler,
+    is_multimodal,
+    mm_encoder_cache_enabled,
+    setup_mm_encoder_attn_metadata,
+)
 from .engine.runners import resolve_runner_type
-from .engine.runners.common import (make_scheduled_inputs,
-                                    resolve_mrope_position_deltas_cache)
+from .engine.runners.common import make_scheduled_inputs, resolve_mrope_position_deltas_cache
 from .engine.runners.decoder import DecoderRunner, DecoderRunnerConfig
 from .engine.runners.decoder.runner import PrefillCompiledModel
 from .engine.runners.encoder import EncoderRunner, EncoderRunnerConfig
-from .engine.runners.encoder_decoder import (EncoderDecoderRunner,
-                                             EncoderDecoderRunnerConfig,
-                                             EncoderStageConfig)
-from .engine.runners.interface import (ModelRunner, PackedInputs,
-                                       PackedModelRunner, ScheduledInputs,
-                                       ScheduledModelRunner)
+from .engine.runners.encoder_decoder import (
+    EncoderDecoderRunner,
+    EncoderDecoderRunnerConfig,
+    EncoderStageConfig,
+)
+from .engine.runners.interface import (
+    ModelRunner,
+    PackedInputs,
+    PackedModelRunner,
+    ScheduledInputs,
+    ScheduledModelRunner,
+)
 from .engine.runners.no_kv_cache import NoKVCacheRunner, NoKVCacheRunnerConfig
 from .engine.runners.pooling import PoolingRunner
 from .guided_decoder import CapturableGuidedDecoder
@@ -220,12 +229,14 @@ class PyTorchModelEngine(ModelEngine):
         self.mapping = mapping
         if mapping.has_pp():
             init_pp_comm(mapping)
-        from ._util import (compute_max_num_sequences,
-                            resolved_kv_cache_manager_is_v2,
-                            should_enable_adp_dummy_fixes,
-                            should_enable_non_overlap_adp_forward_intent,
-                            should_enable_overlap_headroom,
-                            should_enable_scheduler_aware_adp_dummy)
+        from ._util import (
+            compute_max_num_sequences,
+            resolved_kv_cache_manager_is_v2,
+            should_enable_adp_dummy_fixes,
+            should_enable_non_overlap_adp_forward_intent,
+            should_enable_overlap_headroom,
+            should_enable_scheduler_aware_adp_dummy,
+        )
         self._enable_adp_dummy_fixes = should_enable_adp_dummy_fixes(mapping)
         self.dist = dist
         self.llm_args = llm_args
@@ -740,6 +751,7 @@ class PyTorchModelEngine(ModelEngine):
             cuda_graph_specialize_lora=(
                 self.llm_args.lora_config is not None
                 and self.llm_args.lora_config.cuda_graph_specialize_lora),
+            watermark_config=self.llm_args.watermark_config,
             **extra_fields,
         )
 

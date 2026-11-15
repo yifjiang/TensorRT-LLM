@@ -4330,6 +4330,8 @@ class M3Eagle3Worker(Eagle3OneModelWorker):
         _m3_sampled_verify_ok), with nothing else reading the target logits. Every input is host state shared by all
         TP ranks, so the ranks agree.
         """
+        if getattr(spec_metadata, "watermark", None) is not None:
+            return False
         if not self._m3_structural_ok(attn_metadata, spec_metadata):
             return False
         if getattr(spec_metadata, "enable_penalty", False):

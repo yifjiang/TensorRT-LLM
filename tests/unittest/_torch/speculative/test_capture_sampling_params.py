@@ -32,7 +32,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import (
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-from tensorrt_llm._torch.speculative.interface import SpecMetadata
+from tensorrt_llm._torch.speculative.interface import SpecMetadata, SpeculativeDecodingMode
 from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
@@ -109,6 +109,7 @@ def _request(temperature=None, top_k=None, top_p=None, min_p=None, slot=0):
 def _fake_meta():
     return types.SimpleNamespace(
         runtime_draft_len=1,
+        spec_dec_mode=SpeculativeDecodingMode.EAGLE3_ONE_MODEL,
         is_ragged_verify=False,
         dummy_slot_row=0,
         group_all_greedy_sample=None,
@@ -220,12 +221,15 @@ def _populate_meta(mode, draft_len=1):
         request_min_ps=None,
         top_k_max=0,
         _sampling_params_signature=[None, None],
-        spec_dec_mode=types.SimpleNamespace(use_one_engine=lambda: True),
+        spec_dec_mode=SpeculativeDecodingMode.EAGLE3_ONE_MODEL,
         # Not under test.
         prepare_rejection_sampling_buffers=lambda: None,
         prepare_penalty_buffers=lambda: None,
+        prepare_watermark_buffers=lambda: None,
+        watermark_ready=False,
         _populate_request_rng_state=lambda requests, normalized: None,
         _populate_penalty_params=lambda requests: None,
+        _populate_watermark_params=lambda requests: None,
     )
     for name in (
         "_scan_one_model_sampling",

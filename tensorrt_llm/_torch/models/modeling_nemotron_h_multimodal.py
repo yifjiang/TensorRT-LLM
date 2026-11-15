@@ -1313,8 +1313,8 @@ class NemotronHMultimodalInputProcessor(
                 import librosa  # noqa: F401
             except ImportError:
                 raise ImportError(
-                    "Audio support requires the `librosa` package. "
-                    "Install it with: pip install librosa"
+                    "Audio support requires the optional audio dependencies. "
+                    'Install them with: pip install "tensorrt_llm[audio]"'
                 )
             self._audio_extractor = ParakeetExtractor(sound_config)
             if self._sound_context_token_id is None:

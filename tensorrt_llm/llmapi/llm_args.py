@@ -24,16 +24,41 @@ from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum, EnumMeta
 from pathlib import Path
-from typing import (TYPE_CHECKING, Annotated, Any, Callable, ClassVar, Dict,
-                    List, Literal, Optional, Set, Tuple, Type, TypeAlias,
-                    TypeVar, Union, get_args, get_origin)
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    Callable,
+    ClassVar,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Set,
+    Tuple,
+    Type,
+    TypeAlias,
+    TypeVar,
+    Union,
+    get_args,
+    get_origin,
+)
 
 import torch
 import yaml
-from pydantic import AliasChoices, BaseModel, ConfigDict
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    NonNegativeFloat,
+    NonNegativeInt,
+    PositiveInt,
+    PrivateAttr,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 from pydantic import Field as PydanticField
-from pydantic import (NonNegativeFloat, NonNegativeInt, PositiveInt,
-                      PrivateAttr, StrictInt, field_validator, model_validator)
 from strenum import StrEnum
 from transformers import PreTrainedTokenizerBase
 
@@ -43,11 +68,12 @@ except ImportError:
     PlacementGroup = None
 
 from tensorrt_llm._torch.peft.lora.config import (
-    LoraConfig, get_default_trtllm_modules_to_hf_modules)
+    LoraConfig,
+    get_default_trtllm_modules_to_hf_modules,
+)
 from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
 
-from .._utils import (_str_to_torch_dtype_dict, is_sm_100f, mpi_rank,
-                      prefer_pinned)
+from .._utils import _str_to_torch_dtype_dict, is_sm_100f, mpi_rank, prefer_pinned
 
 # yapf: disable
 # isort: off
@@ -70,13 +96,18 @@ from ..logger import logger
 from ..mapping import CpType, Mapping
 from ..models.modeling_utils import QuantAlgo, QuantConfig
 from ..sampling_params import BatchedLogitsProcessor
-from ..tokenizer import TOKENIZER_ALIASES  # noqa: F401
-from ..tokenizer import load_custom_tokenizer
-from ..usage.config import UsageContext  # noqa: F401
-from ..usage.config import TelemetryConfig, TelemetryField
+from ..tokenizer import (
+    TOKENIZER_ALIASES,  # noqa: F401
+    load_custom_tokenizer,
+)
+from ..usage.config import (
+    TelemetryConfig,
+    TelemetryField,
+    UsageContext,  # noqa: F401
+)
+from ..watermark.config import WatermarkConfig
 from .tokenizer import TokenizerBase, tokenizer_factory
-from .utils import (StrictBaseModel, generate_api_docs_as_docstring,
-                    get_type_repr)
+from .utils import StrictBaseModel, generate_api_docs_as_docstring, get_type_repr
 
 TypeBaseModel = TypeVar("T", bound=BaseModel)
 
@@ -84,9 +115,10 @@ if TYPE_CHECKING:
     # Runtime methods import QSA params locally to avoid loading the sparse
     # backend while llm_args is defining its public configuration models.
     from tensorrt_llm._torch.attention.backends.sparse.qsa import (
-        QSASparseMetadataParams, QSASparseParams)
-    from tensorrt_llm._torch.virtual_memory import \
-        RestoreMode as _VirtualMemoryRestoreMode
+        QSASparseMetadataParams,
+        QSASparseParams,
+    )
+    from tensorrt_llm._torch.virtual_memory import RestoreMode as _VirtualMemoryRestoreMode
 else:
     # RestoreMode is also used as a runtime base class below; the QSA names
     # appear only in quoted annotations and need no runtime placeholders.
@@ -991,8 +1023,7 @@ class QSASparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             f"QSA requires {checkpoint_name!r} in the checkpoint config")
 
     def to_sparse_params(self, **kwargs: object) -> "QSASparseParams":
-        from tensorrt_llm._torch.attention.backends.sparse.qsa import \
-            QSASparseParams
+        from tensorrt_llm._torch.attention.backends.sparse.qsa import QSASparseParams
 
         pretrained_config = kwargs.get("pretrained_config")
         if pretrained_config is None:
@@ -1027,8 +1058,7 @@ class QSASparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
 
     def to_sparse_metadata_params(
             self, **kwargs: object) -> "QSASparseMetadataParams":
-        from tensorrt_llm._torch.attention.backends.sparse.qsa import \
-            QSASparseMetadataParams
+        from tensorrt_llm._torch.attention.backends.sparse.qsa import QSASparseMetadataParams
 
         params = self.to_sparse_params(**kwargs)
         return QSASparseMetadataParams(
@@ -1198,8 +1228,9 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         return self.sparse_block_size
 
     def to_sparse_params(self, **kwargs):
-        from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import \
-            MiniMaxM3SparseParams
+        from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import (
+            MiniMaxM3SparseParams,
+        )
 
         return MiniMaxM3SparseParams(
             num_index_heads=self.sparse_num_index_heads,
@@ -1225,8 +1256,9 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         default; num_key_value_heads falls back to num_attention_heads. Setting
         them on the config lets tests skip building a pretrained_config.
         """
-        from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import \
-            MiniMaxM3SparseMetadataParams
+        from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import (
+            MiniMaxM3SparseMetadataParams,
+        )
 
         pretrained_config = kwargs.get("pretrained_config", None)
 
@@ -1273,8 +1305,7 @@ class RocketSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         return self.page_size
 
     def to_sparse_params(self, **kwargs):
-        from tensorrt_llm._torch.attention.backends.sparse.rocket import \
-            RocketKVParams
+        from tensorrt_llm._torch.attention.backends.sparse.rocket import RocketKVParams
 
         def _value(name: str, default):
             value = getattr(self, name)
@@ -1291,8 +1322,7 @@ class RocketSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         )
 
     def to_sparse_metadata_params(self, **kwargs):
-        from tensorrt_llm._torch.attention.backends.sparse.rocket import \
-            RocketKVMetadataParams
+        from tensorrt_llm._torch.attention.backends.sparse.rocket import RocketKVMetadataParams
 
         def _value(name: str, default):
             value = getattr(self, name)
@@ -1529,8 +1559,7 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         )
 
     def to_sparse_metadata_params(self, **kwargs):
-        from tensorrt_llm._torch.attention.backends.sparse.dsa import \
-            DSAMetadataParams
+        from tensorrt_llm._torch.attention.backends.sparse.dsa import DSAMetadataParams
 
         pretrained_config = kwargs.get("pretrained_config", None)
 
@@ -1641,8 +1670,7 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
         return False
 
     def to_sparse_params(self, **kwargs):
-        from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import \
-            DeepSeekV4Params
+        from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import DeepSeekV4Params
 
         pretrained_config = kwargs.get("pretrained_config", None)
 
@@ -1675,8 +1703,9 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
         )
 
     def to_sparse_metadata_params(self, **kwargs):
-        from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import \
-            DeepSeekV4MetadataParams
+        from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import (
+            DeepSeekV4MetadataParams,
+        )
 
         pretrained_config = kwargs.get("pretrained_config", None)
 
@@ -1726,8 +1755,7 @@ class CSA2SparseAttentionConfig(BaseSparseAttentionConfig):
         return backend == "pytorch"
 
     def to_sparse_params(self, **kwargs):
-        from tensorrt_llm._torch.attention.backends.sparse.csa2.params import (
-            CSA2Layout, CSA2Params)
+        from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout, CSA2Params
 
         return CSA2Params(
             layout=CSA2Layout.from_hf_config(kwargs.get("pretrained_config")),
@@ -1736,7 +1764,9 @@ class CSA2SparseAttentionConfig(BaseSparseAttentionConfig):
 
     def to_sparse_metadata_params(self, **kwargs):
         from tensorrt_llm._torch.attention.backends.sparse.csa2.params import (
-            CSA2Layout, CSA2MetadataParams)
+            CSA2Layout,
+            CSA2MetadataParams,
+        )
 
         return CSA2MetadataParams(
             layout=CSA2Layout.from_hf_config(kwargs.get("pretrained_config")))
@@ -1776,9 +1806,11 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         import fnmatch
 
         from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import (
-            SkipSoftmaxParams, SkipSoftmaxScheduler,
+            SkipSoftmaxParams,
+            SkipSoftmaxScheduler,
             skip_softmax_ignore_from_ckpt_sparse_attention_config,
-            skip_softmax_target_sparsity_from_ckpt_sparse_attention_config)
+            skip_softmax_target_sparsity_from_ckpt_sparse_attention_config,
+        )
 
         ckpt_sparse_attention_config = kwargs.get(
             "ckpt_sparse_attention_config", None)
@@ -2580,8 +2612,9 @@ class DecodingBaseConfig(StrictBaseModel):
         # spec_dec_mode has more functionality than the raw decoding_mode string.
         # Use an alias for the import here to avoid name collisions with the one for the
         # TRT backend.
-        from tensorrt_llm._torch.speculative.interface import \
-            SpeculativeDecodingMode as TorchSpeculativeDecodingMode
+        from tensorrt_llm._torch.speculative.interface import (
+            SpeculativeDecodingMode as TorchSpeculativeDecodingMode,
+        )
         return TorchSpeculativeDecodingMode.from_string(
             self.decoding_type.upper())
 
@@ -2689,8 +2722,7 @@ class MooncakeStoreConfig(StrictBaseModel):
     @classmethod
     def _check_segment_size(cls, value):
         """Reject a bad size here rather than in every rank after bringup."""
-        from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import \
-            parse_size
+        from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import parse_size
         try:
             parsed = parse_size(value, strict_units=True)
         except ValueError as exc:
@@ -2740,7 +2772,9 @@ class KvCacheConnectorConfig(StrictBaseModel):
     @model_validator(mode="after")
     def _resolve_preset(self) -> "KvCacheConnectorConfig":
         from tensorrt_llm._torch.pyexecutor.connectors.registry import (
-            CONNECTOR_REGISTRY, uses_connector)
+            CONNECTOR_REGISTRY,
+            uses_connector,
+        )
         if self.connector is not None:
             preset = CONNECTOR_REGISTRY.get(self.connector)
             if preset is None:
@@ -2882,8 +2916,9 @@ class EagleDecodingConfig(DecodingBaseConfig):
 
     @functools.cached_property
     def spec_dec_mode(self):
-        from tensorrt_llm._torch.speculative.interface import \
-            SpeculativeDecodingMode as TorchSpeculativeDecodingMode
+        from tensorrt_llm._torch.speculative.interface import (
+            SpeculativeDecodingMode as TorchSpeculativeDecodingMode,
+        )
         return TorchSpeculativeDecodingMode.EAGLE3_ONE_MODEL
 
     @functools.cached_property
@@ -2990,8 +3025,9 @@ class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
 
     @functools.cached_property
     def spec_dec_mode(self):
-        from tensorrt_llm._torch.speculative.interface import \
-            SpeculativeDecodingMode as TorchSpeculativeDecodingMode
+        from tensorrt_llm._torch.speculative.interface import (
+            SpeculativeDecodingMode as TorchSpeculativeDecodingMode,
+        )
         return TorchSpeculativeDecodingMode.SAVE_HIDDEN_STATES
 
     @functools.cached_property
@@ -3147,8 +3183,9 @@ class DraftTargetDecodingConfig(DecodingBaseConfig):
 
     @functools.cached_property
     def spec_dec_mode(self):
-        from tensorrt_llm._torch.speculative.interface import \
-            SpeculativeDecodingMode as TorchSpeculativeDecodingMode
+        from tensorrt_llm._torch.speculative.interface import (
+            SpeculativeDecodingMode as TorchSpeculativeDecodingMode,
+        )
         return TorchSpeculativeDecodingMode.DRAFT_TARGET_ONE_MODEL
 
 
@@ -3291,8 +3328,9 @@ class MTPDecodingConfig(DecodingBaseConfig):
 
     @property
     def spec_dec_mode(self):
-        from tensorrt_llm._torch.speculative.interface import \
-            SpeculativeDecodingMode as TorchSpeculativeDecodingMode
+        from tensorrt_llm._torch.speculative.interface import (
+            SpeculativeDecodingMode as TorchSpeculativeDecodingMode,
+        )
 
         # num_nextn_predict_layers is set from the model's pretrained config by
         # update_spec_config_from_model_config. Treat None (before model load) as 1.
@@ -3350,8 +3388,9 @@ class PARDDecodingConfig(DecodingBaseConfig):
 
     @functools.cached_property
     def spec_dec_mode(self):
-        from tensorrt_llm._torch.speculative.interface import \
-            SpeculativeDecodingMode as TorchSpeculativeDecodingMode
+        from tensorrt_llm._torch.speculative.interface import (
+            SpeculativeDecodingMode as TorchSpeculativeDecodingMode,
+        )
         return TorchSpeculativeDecodingMode.PARD
 
 
@@ -3607,8 +3646,9 @@ class DFlashDecodingConfig(DecodingBaseConfig):
 
     @functools.cached_property
     def spec_dec_mode(self):
-        from tensorrt_llm._torch.speculative.interface import \
-            SpeculativeDecodingMode as TorchSpeculativeDecodingMode
+        from tensorrt_llm._torch.speculative.interface import (
+            SpeculativeDecodingMode as TorchSpeculativeDecodingMode,
+        )
         return TorchSpeculativeDecodingMode.DFLASH
 
 
@@ -3756,8 +3796,9 @@ class DSparkDecodingConfig(DecodingBaseConfig):
 
     @functools.cached_property
     def spec_dec_mode(self):
-        from tensorrt_llm._torch.speculative.interface import \
-            SpeculativeDecodingMode as TorchSpeculativeDecodingMode
+        from tensorrt_llm._torch.speculative.interface import (
+            SpeculativeDecodingMode as TorchSpeculativeDecodingMode,
+        )
         return TorchSpeculativeDecodingMode.DSPARK
 
 
@@ -5362,8 +5403,7 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
                     "bounce implementation; set agent_bounce_buffer_enable=True "
                     "or drop the params.")
             # Lazy: importing tensorrt_llm._torch at module scope is circular.
-            from tensorrt_llm._torch.disaggregation.nixl.bounce_knobs import \
-                AGENT_BOUNCE_PARAM_KEYS
+            from tensorrt_llm._torch.disaggregation.nixl.bounce_knobs import AGENT_BOUNCE_PARAM_KEYS
             unknown = sorted(
                 set(self.agent_bounce_params) - AGENT_BOUNCE_PARAM_KEYS)
             if unknown:
@@ -6323,6 +6363,16 @@ class TorchLlmArgs(BaseLlmArgs):
         "Separated-routing MoE backends only.",
         status="beta")
 
+    watermark_config: Optional[WatermarkConfig] = Field(
+        default=None,
+        description=
+        "Enables statistical text watermarking of generated tokens (Gumbel-max). "
+        "Requests may opt out with SamplingParams.watermarking=False unless "
+        "allow_request_opt_out is False. Greedy and beam-search requests cannot "
+        "carry a watermark and are generated normally. The key is a secret and "
+        "must match at detection time (see tensorrt_llm.watermark).",
+        status="prototype")
+
     moe_config: MoeConfig = Field(default_factory=MoeConfig,
                                   description="MoE config.",
                                   status="beta")
@@ -6399,6 +6449,21 @@ class TorchLlmArgs(BaseLlmArgs):
         # tensor derives both from the model, and only the engine knows which
         # kind of encoder the model has. It still raises for the token encoders
         # that require them.
+        return self
+
+    @model_validator(mode="after")
+    def validate_watermark_config(self) -> 'TorchLlmArgs':
+        spec = self.speculative_config
+        if (self.watermark_config is not None and spec is not None
+                and spec.spec_dec_mode.is_dspark()):
+            if (self.watermark_config.algorithm != "gumbel"
+                    or not self.watermark_config.allow_target_only_watermarking
+                    or not spec.use_rejection_sampling):
+                raise ValueError(
+                    "DSpark watermarking requires algorithm='gumbel', "
+                    "allow_target_only_watermarking=True and "
+                    "use_rejection_sampling=True. Parallel-draft dual-key "
+                    "and exact-match DSpark watermarking are unsupported.")
         return self
 
     attn_backend: str = Field(
@@ -7036,7 +7101,9 @@ class TorchLlmArgs(BaseLlmArgs):
         """
         from tensorrt_llm._torch.speculative.dflash import (
             derive_dflash_ctx_memory_budget_bytes,
-            estimate_checkpoint_weight_bytes, validate_dflash_ctx_buffer_budget)
+            estimate_checkpoint_weight_bytes,
+            validate_dflash_ctx_buffer_budget,
+        )
 
         spec_cfg = self.speculative_config
 
@@ -7147,8 +7214,9 @@ class TorchLlmArgs(BaseLlmArgs):
                 # retrieval-based drafters that emit only token ids with no q are
                 # excluded: NGram is simply absent from this whitelist, and SA
                 # (sa_config) is rejected below via rs_sa_active.
-                from tensorrt_llm._torch.speculative.interface import \
-                    SpeculativeDecodingMode as TorchSpeculativeDecodingMode
+                from tensorrt_llm._torch.speculative.interface import (
+                    SpeculativeDecodingMode as TorchSpeculativeDecodingMode,
+                )
 
                 spec_mode = self.speculative_config.spec_dec_mode
                 is_supported = (isinstance(self.speculative_config,
@@ -7249,8 +7317,7 @@ class TorchLlmArgs(BaseLlmArgs):
                     rs_dynamic_tree_active = getattr(self.speculative_config,
                                                      "use_dynamic_tree", False)
                     if not rs_dynamic_tree_active:
-                        from tensorrt_llm._torch.flashinfer_utils import \
-                            IS_FLASHINFER_AVAILABLE
+                        from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
                         if not IS_FLASHINFER_AVAILABLE:
                             raise ValueError(
                                 "use_rejection_sampling=True requires FlashInfer, "

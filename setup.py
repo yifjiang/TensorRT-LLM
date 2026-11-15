@@ -145,6 +145,9 @@ required_deps, extra_URLs = parse_requirements(
 devel_deps, _ = parse_requirements(
     Path("requirements-dev-windows.txt"
          if on_windows else "requirements-dev.txt"))
+audio_deps, _ = parse_requirements(Path("requirements-audio.txt"))
+heuristic_deps, _ = parse_requirements(
+    Path("requirements-cutedsl-heuristics.txt"))
 mx_deps = ["modelexpress>=0.5.1,<0.6.0"]
 # OpenEngine's private schema bindings ship in this wheel and use the base
 # grpcio dependency; its empty extra remains an install-compatible feature
@@ -167,10 +170,14 @@ else:
         'libs/libtensorrt_llm_ucx_wrapper.so',
         'libs/libdecoder_attention_0.so',
         'libs/libtensorrt_llm_nixl_wrapper.so',
+        # The precompiled-wheel extractor uses fnmatch, where **/* does not
+        # match direct children. Preserve both the libraries and their plugins.
+        'libs/nixl/*',
         'libs/nixl/**/*',
         'tensorrt_llm_transfer_agent_binding*.so',
         'tensorrt_llm_transfer_agent_binding.pyi',
         'libs/libtensorrt_llm_mooncake_wrapper.so',
+        'libs/ucx/*',
         'libs/ucx/**/*',
         'libs/libpg_utils.so',
         'libs/libdecoder_attention_1.so',
@@ -675,7 +682,9 @@ setup(
     },
     scripts=['tensorrt_llm/llmapi/trtllm-llmapi-launch'],
     extras_require={
-        "devel": devel_deps + grpc_smg_deps,
+        "devel": devel_deps + grpc_smg_deps + audio_deps + heuristic_deps,
+        "audio": audio_deps,
+        "cutedsl-heuristics": heuristic_deps,
         "openengine": [],
         "mx": mx_deps,
         "grpc-smg": grpc_smg_deps,

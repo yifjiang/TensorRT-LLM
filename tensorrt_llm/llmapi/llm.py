@@ -1610,7 +1610,8 @@ class BaseLLM:
                        None)
         reason = spec_sampler_base.one_model_sampling_rejection_reason(
             sampling_params,
-            fused_sampling=bool(mode is not None and mode.is_fused))
+            fused_sampling=bool(mode is not None and mode.is_fused),
+            supports_min_tokens=spec_dec_mode.is_dspark())
         if reason is not None:
             raise RequestError(reason)
 

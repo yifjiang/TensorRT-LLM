@@ -1340,6 +1340,25 @@ def maybe_compute_mm_embed_cumsum(
         0, dtype=torch.int64)
 
 
+def _mm_item_order_signature(order: Any) -> List[Tuple[str, int]]:
+    """Compare item identity/order without optional placeholder text metadata."""
+    if not isinstance(order, list):
+        raise ValueError(
+            "Multimodal item order must be a list of item entries.")
+    result = []
+    for entry in order:
+        if (not isinstance(entry, dict)
+                or not isinstance(entry.get("modality"), str)
+                or type(entry.get("index")) is not int or entry["index"] < 0):
+            raise ValueError(
+                "Multimodal item order contains a malformed item entry.")
+        result.append((entry["modality"], entry["index"]))
+    if len(result) != len(set(result)):
+        raise ValueError(
+            "Multimodal item order contains duplicate item entries.")
+    return result
+
+
 def create_input_processor_with_hash(
     input_processor: BaseMultimodalInputProcessor,
     hash_lib=default_hasher,
@@ -1371,8 +1390,9 @@ def create_input_processor_with_hash(
         positions, and masks on top.
 
         Supports optional user-provided UUIDs via 'multi_modal_uuids' in inputs.
-        When a UUID is provided for a multimodal item, it will be used as the
-        cache identifier and returned in KV cache events instead of the content hash.
+        When a UUID is provided for a multimodal item, it contributes to the
+        derived cache digest and is preserved as the external identity in KV
+        cache events.
         """
         assert 'multi_modal_data' in inputs, "multi_modal_data must be provided for hashing support."
         mm_data = inputs['multi_modal_data']
@@ -1392,6 +1412,19 @@ def create_input_processor_with_hash(
         if not isinstance(multimodal_data, dict):
             raise TypeError(
                 "extra_processed_inputs['multimodal_data'] must be a dict")
+        incoming_order = inputs.get("mm_item_order")
+        layout = multimodal_data.get("layout_metadata")
+        encoded_order = layout.get("mm_item_order") if isinstance(
+            layout, dict) else None
+        if (incoming_order and encoded_order
+                and _mm_item_order_signature(incoming_order)
+                != _mm_item_order_signature(encoded_order)):
+            raise ValueError(
+                "Incoming multimodal item order conflicts with the processor's encoded item order."
+            )
+        # When the processor derives an order from real token placeholders,
+        # hashing and feature concatenation must use that same authority.
+        mm_item_order = encoded_order or incoming_order
         if encoder_cache_enabled:
             multimodal_data[
                 "mm_processor_kwargs_hash"] = _hash_mm_processor_kwargs(
@@ -1416,7 +1449,6 @@ def create_input_processor_with_hash(
         # `mm_hashes_flat`, `start_positions`, and `num_mm_tokens` must all
         # index items at the same offsets — project into prompt order via the
         # manifest.
-        mm_item_order = inputs.get("mm_item_order")
         if mm_item_order:
             num_mm_tokens = [
                 num_mm_tokens_by_key[e["modality"]][e["index"]]
@@ -1471,7 +1503,6 @@ def create_input_processor_with_hash(
                 "special_token_offsets"] = start_special_token_positions
         # Same prompt-order projection as `num_mm_tokens` above — the cache
         # key indexes each item's digest by its `start_positions` offset.
-        mm_item_order = inputs.get("mm_item_order")
         if mm_item_order:
             mm_hashes_flat = [
                 mm_hashes[e["modality"]][e["index"]] for e in mm_item_order
