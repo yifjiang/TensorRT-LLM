@@ -498,6 +498,8 @@ class M3DSparkWorker(S4WorkerMixin, DSparkWorker):
         sampler runs exactly once either way."""
         if N3A_DISABLED or spec_metadata is None or spec_metadata.is_ragged_verify:
             return False
+        if getattr(spec_metadata, "watermark", None) is not None:
+            return False
         if num_contexts != 0 or batch_size <= 0 or draft_tokens.dim() != 2:
             return False
         n_req, draft_len = draft_tokens.shape

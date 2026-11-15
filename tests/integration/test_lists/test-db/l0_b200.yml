@@ -257,6 +257,7 @@ l0_b200:
   # function's leaves on Blackwell, keep the rest of the sampler dir.
   - unittest/_torch/sampler -k "not test_speculative_d2h_parity_real_predictor"
   - unittest/_torch/speculative/test_eagle3.py
+  - unittest/_torch/speculative/test_watermark_block_cuda.py
   - unittest/_torch/speculative/test_watermark_spec.py
   - unittest/_torch/speculative/test_native_ragged_watermark_cuda.py
   - unittest/_torch/speculative/test_lilicorr_loading.py

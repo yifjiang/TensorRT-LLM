@@ -234,6 +234,7 @@ l0_cpu:
   - unittest/llmapi/test_whisper_suppress_tokens_processor.py
   - unittest/llmapi/test_kv_cache_dtype_override.py
   - unittest/llmapi/test_llm_args.py
+  - unittest/_torch/speculative/test_watermark_block_oracle.py
   - unittest/llmapi/test_watermark_m31_config.py
   - unittest/_torch/sampler/test_watermark_runtime.py
   - unittest/llmapi/test_mx_args.py

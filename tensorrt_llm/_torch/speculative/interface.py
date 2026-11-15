@@ -52,6 +52,7 @@ from ..pyexecutor.sampler.ops.vanilla import greedy_search_sampling_batch
 from ..pyexecutor.sampler.watermark import WatermarkSpecState
 from . import minimum_length as minimum_length_ops
 from .block_verification import block_verify, counter_uniforms
+from .watermark_target import conditional_watermark_target
 
 # Logit given to token 0 of a CUDA-graph padding row (see
 # SpecWorkerBase._zero_padding_rows). Finite in
@@ -3170,10 +3171,9 @@ class SpecWorkerBase(nn.Module, ABC):
                                                  batch_size,
                                                  runtime_draft_len + 1,
                                                  packed_verify=True)
-            # The target distribution the acceptance test divides by. It must be
-            # filtered exactly as the draft probs were (see advanced_sample_draft),
-            # which is why both use the same backend selection on the same mode --
-            # a mismatch here corrupts acceptance silently rather than raising.
+            # Build the target law from the request's filters. The proposal may
+            # use different filters, but its stored probabilities must describe
+            # the law that actually produced the drafts.
             target_probs_flat = self._compute_probs_from_logits(
                 spec_metadata.advanced_sampling_mode, gen_logits, temperatures,
                 spec_metadata.top_ks[gen_start:gen_end],
@@ -3286,6 +3286,26 @@ class SpecWorkerBase(nn.Module, ABC):
                 slot=spec_metadata.rng_accept_slot)
 
             use_block = spec_metadata.rejection_sample_method == "block"
+            full_watermark = (
+                _watermark_active(spec_metadata)
+                and spec_metadata.spec_dec_mode.is_dspark()
+                and not spec_metadata.watermark.config.allow_target_only_watermarking
+            )
+            if full_watermark:
+                if not use_block or is_ragged:
+                    raise ValueError(
+                        "Full DSpark watermarking requires fixed-length block verification"
+                    )
+                _, generation_plan = self._plan_watermark(
+                    spec_metadata, num_contexts, batch_size, draft_tokens,
+                    plan_contexts=False)
+                target_probs = conditional_watermark_target(
+                    target_probs, generation_plan.seeds, generation_plan.active,
+                    gumbel_sample_from_probs)
+            elif _watermark_active(spec_metadata) and use_block:
+                raise ValueError(
+                    "Target-only/dual-key watermark recovery does not support block verification"
+                )
             slot_out = None
             if slot_rows is not None:
                 if not use_block:
@@ -3326,7 +3346,7 @@ class SpecWorkerBase(nn.Module, ABC):
                     offset=offset,
                 )
 
-            if _watermark_active(spec_metadata):
+            if _watermark_active(spec_metadata) and not full_watermark:
                 # The kernel decides which drafts are accepted and draws the token that
                 # follows them. Redraw that token under the watermark's second key so the
                 # output distribution stays the target's (see keyed_recovery).

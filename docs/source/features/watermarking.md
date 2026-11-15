@@ -56,13 +56,15 @@ share their verification).
   the target itself sampled at that position, so the output is exactly what plain decoding with the
   same key produces, and the watermark strength does not depend on the acceptance rate.
 - **Rejection sampling (`use_rejection_sampling=True`).** Accepted draft tokens were not sampled from
-  the target, so they need care. Two modes are supported:
+  the target, so they need care. The supported compositions are:
   - `algorithm="gumbel_dual_key"` draws the draft tokens under the key and the token that follows the
     accepted prefix under a second key derived from it. The two draws and the accept decisions are
     independent, so the output distribution stays exact. The detector tests every token against both
     keys. Requires an autoregressive drafter (Eagle3, MTP, DraftTarget).
   - `allow_target_only_watermarking=True` leaves accepted draft tokens unmarked and watermarks only the
     token that follows them. The signal weakens as the acceptance rate rises.
+
+  - DSpark with fixed-length block verification uses the conditional keyed target described below.
 
   Without one of these, a watermarked request fails at admission. `gumbel_dual_key` is also rejected at
   admission with parallel-draft speculation.
@@ -118,26 +120,51 @@ specific combinations:
 - Not supported, and rejected by the engine:
   - NGram and user-provided drafts: at startup.
   - DSpark with dual-key or exact-match verification: when the LLM arguments are validated.
-  - Tree (dynamic tree) speculation, relaxed acceptance for thinking, and rejection sampling without a
-    dual-key or target-only setting: at request admission.
+  - Tree (dynamic tree) speculation, relaxed acceptance for thinking, and rejection sampling outside the
+    supported compositions: at request admission.
 
-## DSpark target-only extension
+## DSpark block verification with full coverage
 
-DSpark is supported only with `algorithm="gumbel"`,
-`allow_target_only_watermarking=True`, and `use_rejection_sampling=True`. The
-parallel drafter and its native acceptance probabilities remain unchanged.
-Accepted draft tokens carry no watermark; the target-selected replacement or
-bonus token takes the keyed Gumbel draw. Detection uses the same public
-`GumbelWatermarkDetector` with the matching configuration and tokenizer. The
-signal weakens as more drafts are accepted.
+Use `algorithm="gumbel"`, `allow_target_only_watermarking=False`, and:
 
-Ragged verification uses each request's real window length. Its local bonus is
-sampled from the target distribution, rather than from padding used internally
-by native acceptance. Only the executed accepted prefix advances the device
-state. A host stop that clips that prefix invalidates the slot for reconstruction
-from the delivered history before its next use.
+```yaml
+speculative_config:
+  decoding_type: DSpark
+  use_rejection_sampling: true
+  rejection_sample_method: block
+```
 
-M3's specialized fused verification is disabled for an engine with a watermark
-configuration, because it bypasses keyed target recovery. This applies to every
-request in that engine, including opted-out and greedy requests, keeping the
-captured graph choice consistent.
+Let `p_j` be the filtered, grammar-masked target distribution at causal history
+`h ++ drafts[:j]`, and let `g_j` be its existing single-key Philox/Gumbel draw.
+Conditioned on the key and history, the marked target law is the point mass
+`P_j(v) = 1[v = g_j]` at eligible positions; at other positions it is `p_j`.
+The proposal `q_j` remains the actual ancestral drafter law, including its
+Markov dependence on the token actually proposed at the preceding position.
+The block verifier consumes `q_j` and `P_j` directly, including its weighted
+residual `(w_previous * P_j - q_j)+` and the bonus law `P_K`. No keyed redraw is
+applied after block verification.
+
+Consequently, every eligible committed draft, replacement, and bonus token
+satisfies the same single-key target law as autoregressive watermarking.
+Hypothetical contexts after a rejected draft never enter committed state.
+Repeated contexts, opt-out, and greedy eligibility keep their existing rules.
+The detector, key interpretation, PRF, and context width are unchanged.
+Acceptance can be lower than for an unconditioned target, especially at high
+entropy; full coverage does not imply a throughput improvement.
+
+Full coverage requires fixed-length block verification. Ragged verification
+fails explicitly on this path. For a standalone DSpark drafter, guided target
+masking runs before target probabilities are formed; drafting may remain
+unconstrained because verification assigns zero mass to invalid tokens. The
+existing accepted-prefix grammar rollback runs after the drafting kernels.
+A mask that permits only deterministic output may carry little detector signal.
+
+The legacy target-only mode remains available with
+`allow_target_only_watermarking=True` and standard token rejection. It leaves
+accepted drafts unmarked. It is rejected with block verification because its
+post-verification recovery implements the standard, unweighted residual.
+
+M3 fused strict acceptance is disabled whenever watermark state is configured,
+including for opted-out requests, so a captured fallback cannot bypass state
+updates. These contracts require separate exact-image/model qualification;
+component and oracle tests alone do not establish serving support.

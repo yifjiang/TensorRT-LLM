@@ -129,3 +129,22 @@ def test_plain_dspark_does_not_acquire_watermark_restrictions():
         speculative_config=DSparkDecodingConfig(max_draft_len=7, use_rejection_sampling=False),
     )
     assert args.validate_watermark_config() is args
+
+
+def test_dspark_full_watermark_accepts_block_verification():
+    args = TorchLlmArgs.model_construct(
+        watermark_config=WatermarkConfig(key=7),
+        speculative_config=DSparkDecodingConfig(
+            max_draft_len=7, use_rejection_sampling=True, rejection_sample_method="block"),
+    )
+    assert args.validate_watermark_config() is args
+
+
+def test_dspark_target_only_block_recovery_is_not_admitted():
+    args = TorchLlmArgs.model_construct(
+        watermark_config=WatermarkConfig(key=7, allow_target_only_watermarking=True),
+        speculative_config=DSparkDecodingConfig(
+            max_draft_len=7, use_rejection_sampling=True, rejection_sample_method="block"),
+    )
+    with pytest.raises(ValueError, match="Target-only"):
+        args.validate_watermark_config()
