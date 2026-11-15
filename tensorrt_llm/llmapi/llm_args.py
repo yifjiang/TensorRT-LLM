@@ -6456,14 +6456,18 @@ class TorchLlmArgs(BaseLlmArgs):
         spec = self.speculative_config
         if (self.watermark_config is not None and spec is not None
                 and spec.spec_dec_mode.is_dspark()):
-            if (self.watermark_config.algorithm != "gumbel"
-                    or not self.watermark_config.allow_target_only_watermarking
-                    or not spec.use_rejection_sampling):
+            if self.watermark_config.algorithm != "gumbel" or not spec.use_rejection_sampling:
                 raise ValueError(
-                    "DSpark watermarking requires algorithm='gumbel', "
-                    "allow_target_only_watermarking=True and "
-                    "use_rejection_sampling=True. Parallel-draft dual-key "
-                    "and exact-match DSpark watermarking are unsupported.")
+                    "DSpark watermarking requires algorithm='gumbel' and "
+                    "use_rejection_sampling=True.")
+            if not self.watermark_config.allow_target_only_watermarking:
+                if spec.rejection_sample_method != "block":
+                    raise ValueError(
+                        "Full DSpark watermarking requires fixed-length block verification "
+                        "(rejection_sample_method='block').")
+            elif spec.rejection_sample_method == "block":
+                raise ValueError(
+                    "Target-only watermarking requires standard rejection sampling.")
         return self
 
     attn_backend: str = Field(
@@ -7246,7 +7250,10 @@ class TorchLlmArgs(BaseLlmArgs):
                 # uniform -- see SpecMetadata.group_all_greedy_sample). Only
                 # context parallelism remains gated.
                 rs_parallel_active = self.context_parallel_size > 1
-                rs_guided_active = self.guided_decoding_backend is not None
+                rs_guided_active = (
+                    self.guided_decoding_backend is not None
+                    and not (spec_mode.is_dspark()
+                             and self.speculative_config.speculative_model is not None))
                 rs_sa_active = getattr(self.speculative_config, "sa_config",
                                        None) is not None
                 rs_relaxed_active = getattr(

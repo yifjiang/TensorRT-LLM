@@ -670,13 +670,21 @@ def _watermark_unsupported_reason(spec_config,
     if watermark_config is not None and get_force_num_accepted_tokens_float() != 0.0:
         return ("Text watermarking is not supported with forced speculative acceptance. "
                 "Unset TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS.")
-    if watermark_config is not None and spec_config.spec_dec_mode.is_dspark():
+    full_dspark = (
+        watermark_config is not None
+        and spec_config.spec_dec_mode.is_dspark()
+        and not watermark_config.allow_target_only_watermarking
+    )
+    if full_dspark:
         if (watermark_config.algorithm != "gumbel"
-                or not watermark_config.allow_target_only_watermarking
-                or not getattr(spec_config, "use_rejection_sampling", False)):
-            return ("DSpark text watermarking requires algorithm='gumbel', "
-                    "allow_target_only_watermarking=True and use_rejection_sampling=True. "
-                    "Dual-key and exact-match DSpark watermarking are unsupported.")
+                or not getattr(spec_config, "use_rejection_sampling", False)
+                or getattr(spec_config, "rejection_sample_method", None) != "block"):
+            return "Full DSpark watermarking requires Gumbel and fixed-length block verification."
+    elif watermark_config is not None and spec_config.spec_dec_mode.is_dspark():
+        if (watermark_config.algorithm != "gumbel"
+                or not getattr(spec_config, "use_rejection_sampling", False)
+                or getattr(spec_config, "rejection_sample_method", None) == "block"):
+            return "DSpark target-only watermarking requires Gumbel and standard rejection sampling."
     if _is_effective_dynamic_tree(spec_config):
         return (
             "Text watermarking is not supported with tree (dynamic tree) speculative "
@@ -685,7 +693,7 @@ def _watermark_unsupported_reason(spec_config,
     if (getattr(spec_config, "use_rejection_sampling", False)
             and watermark_config is not None):
         dual_key = watermark_config.algorithm == "gumbel_dual_key"
-        if not dual_key and not watermark_config.allow_target_only_watermarking:
+        if not dual_key and not watermark_config.allow_target_only_watermarking and not full_dspark:
             return (
                 "Text watermarking with use_rejection_sampling needs "
                 "watermark_config.algorithm='gumbel_dual_key', or "

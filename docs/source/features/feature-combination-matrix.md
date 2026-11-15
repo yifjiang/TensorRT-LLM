@@ -42,8 +42,9 @@ dtypes, replay environment variables, and accuracy-validation requirements.
 
 [Text watermarking](watermarking.md) supplies keyed Gumbel-max sampling in the
 PyTorch backend. Tree, relaxed-acceptance, NGram and user-provided-draft modes
-remain unsupported. DSpark uses the explicitly enabled target-only rejection
-sampling extension described there; parallel-drafter dual-key mode is rejected.
+remain unsupported. DSpark fixed-length block verification can consume the
+conditional single-key target law for full eligible-token coverage. Its legacy
+target-only mode requires standard rejection; parallel-drafter dual-key mode is rejected.
 M3 fused verification that bypasses keyed recovery is disabled when an engine
 has a watermark configuration. Hardware and serving qualification are scoped to
 the tested deployment rather than inferred from this compatibility description.
